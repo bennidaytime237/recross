@@ -17,6 +17,7 @@
     --across: #0891b2;
     --fail: #f87171;
     --ok: #2dd4bf;
+    --warn: #fbbf24;
   }
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body {
@@ -79,7 +80,7 @@
     display: flex;
     flex-direction: column;
     align-items: flex-start;
-    min-height: 220px;
+    min-height: 240px;
   }
   .card.relay  { border: 1px solid var(--relay);  box-shadow: 0 0 0 1px rgba(124, 58, 237, 0.25), 0 0 32px -14px rgba(124, 58, 237, 0.5); }
   .card.across { border: 1px solid var(--across); box-shadow: 0 0 0 1px rgba(8, 145, 178, 0.25),  0 0 32px -14px rgba(8, 145, 178, 0.5); }
@@ -96,7 +97,7 @@
     letter-spacing: 0.04em;
   }
   .count {
-    font-size: clamp(56px, 10vw, 92px);
+    font-size: clamp(48px, 9vw, 80px);
     font-weight: 700;
     line-height: 1;
     font-variant-numeric: tabular-nums;
@@ -111,12 +112,22 @@
     0%, 100% { opacity: 0.85; filter: brightness(1); }
     50%      { opacity: 0.35; filter: brightness(1.5); }
   }
-  .progress {
+  .metrics {
     margin-top: 12px;
-    font-size: 12px;
-    color: var(--ink-muted);
-    min-height: 16px;
+    font-size: 13px;
+    color: var(--ink-secondary);
+    min-height: 18px;
+    font-variant-numeric: tabular-nums;
   }
+  .note {
+    margin-top: 6px;
+    font-size: 11px;
+    color: var(--warn);
+    min-height: 14px;
+    max-width: 100%;
+    overflow-wrap: anywhere;
+  }
+  .note.muted { color: var(--ink-muted); }
   .card-sub {
     margin-top: auto;
     padding-top: 14px;
@@ -163,6 +174,7 @@
   .chain-row:last-child { border-bottom: none; }
   .chain-row .name  { color: var(--ink-secondary); }
   .chain-row .num   { color: var(--fail); font-variant-numeric: tabular-nums; font-weight: 600; }
+  .chain-row .num .den { color: var(--ink-muted); font-weight: 400; }
   .chain-row.empty  { color: var(--ink-muted); justify-content: flex-start; border-bottom: none; }
   .skeleton {
     height: 14px;
@@ -173,6 +185,13 @@
     animation: skel 1.3s linear infinite;
   }
   @keyframes skel { from { background-position: 200% 0; } to { background-position: -200% 0; } }
+  .methodology {
+    margin-top: 28px;
+    font-size: 11px;
+    line-height: 1.7;
+    color: var(--ink-muted);
+  }
+  .methodology b { color: var(--ink-secondary); font-weight: 600; }
 </style>
 </head>
 <body>
@@ -204,8 +223,9 @@
         <span class="proto-name">Relay</span>
       </div>
       <div class="count loading" id="relay-count">—</div>
-      <div class="progress" id="relay-progress"></div>
-      <div class="card-sub">failed requests</div>
+      <div class="metrics" id="relay-metrics"></div>
+      <div class="note muted" id="relay-note"></div>
+      <div class="card-sub">failed + refunded / completed requests</div>
     </div>
 
     <div class="card across">
@@ -223,20 +243,36 @@
         <span class="proto-name">Across</span>
       </div>
       <div class="count loading" id="across-count">—</div>
-      <div class="progress" id="across-progress"></div>
-      <div class="card-sub">expired / refunded / stuck deposits</div>
+      <div class="metrics" id="across-metrics"></div>
+      <div class="note muted" id="across-note"></div>
+      <div class="card-sub">unfilled (expired · refunded · stuck) / decided deposits</div>
     </div>
   </div>
 
   <div class="breakdown">
     <div class="col relay-col">
-      <div class="col-title"><span class="dot"></span>Relay · by origin chain</div>
+      <div class="col-title"><span class="dot"></span>Relay · failures by origin chain</div>
       <div id="relay-chains"></div>
     </div>
     <div class="col across-col">
-      <div class="col-title"><span class="dot"></span>Across · by origin chain</div>
+      <div class="col-title"><span class="dot"></span>Across · unfilled / decided by origin chain</div>
       <div id="across-chains"></div>
     </div>
+  </div>
+
+  <div class="methodology">
+    <b>Methodology.</b> Relay: every request in the window with status
+    <b>failure</b> or <b>refund</b> (both are failed requests — a refund is paid
+    because the transfer could not complete), rated against completed requests
+    (success + failure + refund); in-flight requests are excluded from the rate.
+    Across: <b>FundsDeposited</b> events are scanned from every EVM SpokePool
+    (addresses resolved live from the HubPool registry) and matched against
+    <b>FilledRelay</b> / slow-fill events. A deposit counts once its fill
+    deadline has passed ("decided"): matched = filled, unmatched = failed
+    (fills are impossible after the deadline). Apparent failures are
+    double-checked against the Across status API. Deposits whose deadline has
+    not passed yet, or that cannot be verified, are excluded from the rate and
+    reported separately. Non-EVM origins (Solana, Tron) are not scanned.
   </div>
 </div>
 
@@ -248,32 +284,44 @@
 /* config                                                              */
 /* ------------------------------------------------------------------ */
 
-const REFRESH_MS = 90_000;
-const RPC_TIMEOUT_MS = 8_000;
-const RELAY_MAX_PAGES = 10;
-const ACROSS_PAGES_PER_CHAIN = 3;
-const ACROSS_BLOCKS_PER_PAGE = 2000;
-const ACROSS_STATUS_CHECK_CAP = 20;
+const REFRESH_MS = 120_000;
+const RPC_TIMEOUT_MS = 10_000;
+const API_TIMEOUT_MS = 15_000;
 
-const ACROSS_CHAINS = [
-  { id: 1,       spokePool: '0x5c7BCd6E7De5423a257D81B442095A1a6ced35C5',  rpc: 'https://ethereum-rpc.publicnode.com',             blocksPerHour: 300   },
-  { id: 42161,   spokePool: '0xe35e9842fceaCA96570B734083f4a58e8F7C5f2A',  rpc: 'https://arb1.arbitrum.io/rpc',                    blocksPerHour: 14400 },
-  { id: 8453,    spokePool: '0x09aea4b2242abC8bb4BB78D537A67a245A7bEC64',  rpc: 'https://mainnet.base.org',                        blocksPerHour: 1800  },
-  { id: 10,      spokePool: '0x6f26Bf09B1C792e3228e5467807a900A503c0281',  rpc: 'https://mainnet.optimism.io',                     blocksPerHour: 1800  },
-  { id: 137,     spokePool: '0x9295ee1d8C5b022Be115A2AD3c30C72E34e7F096',  rpc: 'https://polygon-bor-rpc.publicnode.com',          blocksPerHour: 1600  },
-  { id: 59144,   spokePool: '0x7E63A5f1a8F0B4d0934B2f2327DAED3F6bb2ee75',  rpc: 'https://linea-rpc.publicnode.com',                blocksPerHour: 300   },
-  { id: 324,     spokePool: '0xE0B015E54d54fc84a6cB9B666099Fb76B795535FF', rpc: 'https://mainnet.era.zksync.io',                   blocksPerHour: 3600  },
-  { id: 81457,   spokePool: '0x2D509190Ed0172ba588407D4c2df918F955Cc6E1',  rpc: 'https://blast-rpc.publicnode.com',                blocksPerHour: 1800  },
-  { id: 56,      spokePool: '0x4e8E3B22b0F0a6821F5e1a04D84b4Bc30ACE27d505', rpc: 'https://bsc-rpc.publicnode.com',                 blocksPerHour: 1200  },
-  { id: 130,     spokePool: '0x09aea4b2242abC8bb4BB78D537A67a245A7bEC64',  rpc: 'https://unichain-rpc.publicnode.com',             blocksPerHour: 3600  },
-  { id: 480,     spokePool: '0x09aea4b2242abC8bb4BB78D537A67a245A7bEC64',  rpc: 'https://worldchain-mainnet.g.alchemy.com/public', blocksPerHour: 1800  },
-  { id: 7777777, spokePool: '0x13fDac9F9b4777705db45291bbFF3c972c6d1d97',  rpc: 'https://rpc.zora.energy',                         blocksPerHour: 1800  },
-  { id: 34443,   spokePool: '0x3baD7AD0728f9917d1Bf08af5782dCbD516cDd96',  rpc: 'https://mainnet.mode.network',                    blocksPerHour: 1800  },
-  { id: 1135,    spokePool: '0x9552a0a6624A23B848060AE5901659CDDa1f83f8',  rpc: 'https://rpc.api.lisk.com',                        blocksPerHour: 1800  },
-  { id: 1868,    spokePool: '0x3baD7AD0728f9917d1Bf08af5782dCbD516cDd96',  rpc: 'https://rpc.soneium.org',                         blocksPerHour: 1800  },
-  { id: 57073,   spokePool: '0xeF684C38f94F227E42bE8f21C99F4e65f9f73d4',   rpc: 'https://rpc-qnd.inkonchain.com',                  blocksPerHour: 1800  },
-  { id: 999,     spokePool: '0x35E6DE4C8A0c5f2d2F16E84f94eF4eBe4B990E04',  rpc: 'https://rpc.hyperliquid.xyz/evm',                 blocksPerHour: 3600  },
-];
+const RELAY_API = 'https://api.relay.link/requests/v2';
+const RELAY_PAGE_LIMIT = 50;
+const RELAY_FAIL_PAGES_MAX = 30;    // per failed status: up to 1500 failures counted
+const RELAY_SAMPLE_PAGES_MAX = 12;  // all-status sample used for the rate denominator
+
+const HUBPOOL = '0xc186fA914353c44b2E33eBE05f21846F1048bEda'; // Ethereum mainnet registry of all SpokePools
+const ETH_RPCS = ['https://ethereum-rpc.publicnode.com', 'https://eth.drpc.org'];
+const ACROSS_API_HOSTS = ['https://app.across.to/api', 'https://public.api.across.to'];
+const LOG_CHUNK_BLOCKS = 4000;
+const MAX_CHUNKS_PER_CHAIN = 45;    // 180k blocks — covers 24h everywhere except ultra-fast chains
+const STATUS_VERIFY_CAP = 40;       // apparent failures double-checked via status API per refresh
+const SCAN_CONCURRENCY = 5;
+const QUOTE_TS_SLACK = 300;         // quoteTimestamp lags deposit time by up to a few minutes
+
+// Fallback RPCs for when /swap/chains is unreachable or its publicRpcUrl fails.
+const FALLBACK_RPCS = {
+  1:       'https://ethereum-rpc.publicnode.com',
+  10:      'https://mainnet.optimism.io',
+  56:      'https://bsc-rpc.publicnode.com',
+  130:     'https://unichain-rpc.publicnode.com',
+  137:     'https://polygon-bor-rpc.publicnode.com',
+  324:     'https://mainnet.era.zksync.io',
+  480:     'https://worldchain-mainnet.g.alchemy.com/public',
+  999:     'https://rpc.hyperliquid.xyz/evm',
+  1135:    'https://rpc.api.lisk.com',
+  1868:    'https://rpc.soneium.org',
+  8453:    'https://mainnet.base.org',
+  34443:   'https://mainnet.mode.network',
+  42161:   'https://arb1.arbitrum.io/rpc',
+  57073:   'https://rpc-qnd.inkonchain.com',
+  59144:   'https://linea-rpc.publicnode.com',
+  81457:   'https://blast-rpc.publicnode.com',
+  7777777: 'https://rpc.zora.energy',
+};
 
 const CHAIN_NAMES = {
   1: 'Ethereum', 10: 'Optimism', 56: 'BNB Chain', 100: 'Gnosis', 130: 'Unichain',
@@ -286,14 +334,36 @@ const CHAIN_NAMES = {
   1151111081099710: 'Solana',
 };
 
-const V3_DEPOSIT_ABI = [
+/* ------------------------------------------------------------------ */
+/* Across ABI / topics                                                 */
+/*                                                                     */
+/* SpokePools migrated from the V3* events (address fields, uint32     */
+/* depositId) to bytes32-field events with uint256 depositId. Both     */
+/* generations are recognized so partially-upgraded chains still       */
+/* count. Indexed layout is identical across generations:              */
+/*   deposits: topics = [sig, destinationChainId, depositId, depositor]*/
+/*   fills:    topics = [sig, originChainId, depositId, relayer]       */
+/* ------------------------------------------------------------------ */
+
+const ACROSS_EVENT_ABI = [
+  'event FundsDeposited(bytes32 inputToken, bytes32 outputToken, uint256 inputAmount, uint256 outputAmount, uint256 indexed destinationChainId, uint256 indexed depositId, uint32 quoteTimestamp, uint32 fillDeadline, uint32 exclusivityDeadline, bytes32 indexed depositor, bytes32 recipient, bytes32 exclusiveRelayer, bytes message)',
   'event V3FundsDeposited(address inputToken, address outputToken, uint256 inputAmount, uint256 outputAmount, uint256 indexed destinationChainId, uint32 indexed depositId, uint32 quoteTimestamp, uint32 fillDeadline, uint32 exclusivityDeadline, address indexed depositor, address recipient, address exclusiveRelayer, bytes message)',
+  'event FilledRelay(bytes32 inputToken, bytes32 outputToken, uint256 inputAmount, uint256 outputAmount, uint256 repaymentChainId, uint256 indexed originChainId, uint256 indexed depositId, uint32 fillDeadline, uint32 exclusivityDeadline, bytes32 exclusiveRelayer, bytes32 indexed relayer, bytes32 depositor, bytes32 recipient, bytes32 messageHash, (bytes32 updatedRecipient, bytes32 updatedMessageHash, uint256 updatedOutputAmount, uint8 fillType) relayExecutionInfo)',
+  'event FilledV3Relay(address inputToken, address outputToken, uint256 inputAmount, uint256 outputAmount, uint256 repaymentChainId, uint256 indexed originChainId, uint32 indexed depositId, uint32 fillDeadline, uint32 exclusivityDeadline, address exclusiveRelayer, address indexed relayer, address depositor, address recipient, bytes message, (address updatedRecipient, bytes updatedMessage, uint256 updatedOutputAmount, uint8 fillType) relayExecutionInfo)',
+  'event RequestedSlowFill(bytes32 inputToken, bytes32 outputToken, uint256 inputAmount, uint256 outputAmount, uint256 indexed originChainId, uint256 indexed depositId, uint32 quoteTimestamp, uint32 fillDeadline, uint32 exclusivityDeadline, bytes32 depositor, bytes32 recipient, bytes32 exclusiveRelayer, bytes message)',
+  'event RequestedV3SlowFill(address inputToken, address outputToken, uint256 inputAmount, uint256 outputAmount, uint256 indexed originChainId, uint32 indexed depositId, uint32 quoteTimestamp, uint32 fillDeadline, uint32 exclusivityDeadline, address depositor, address recipient, address exclusiveRelayer, bytes message)',
 ];
-let depositIface = null;
-let DEPOSIT_TOPIC = null;
+const HUBPOOL_ABI = ['function crossChainContracts(uint256 chainId) view returns (address adapter, address spokePool)'];
+
+let acrossIface = null;
+let hubIface = null;
+const TOPIC = { deposits: [], fills: [], slowFills: [] };
 try {
-  depositIface = new ethers.utils.Interface(V3_DEPOSIT_ABI);
-  DEPOSIT_TOPIC = depositIface.getEventTopic('V3FundsDeposited');
+  acrossIface = new ethers.utils.Interface(ACROSS_EVENT_ABI);
+  hubIface = new ethers.utils.Interface(HUBPOOL_ABI);
+  TOPIC.deposits  = [acrossIface.getEventTopic('FundsDeposited'), acrossIface.getEventTopic('V3FundsDeposited')];
+  TOPIC.fills     = [acrossIface.getEventTopic('FilledRelay'), acrossIface.getEventTopic('FilledV3Relay')];
+  TOPIC.slowFills = [acrossIface.getEventTopic('RequestedSlowFill'), acrossIface.getEventTopic('RequestedV3SlowFill')];
 } catch { /* ethers CDN unavailable — Across scan disabled, Relay still works */ }
 
 /* ------------------------------------------------------------------ */
@@ -324,139 +394,357 @@ async function rpcCall(rpcUrl, method, params) {
   return json.result;
 }
 
+// Try the same call against each RPC URL in order.
+async function rpcAny(rpcUrls, method, params) {
+  let lastErr;
+  for (const url of rpcUrls) {
+    try { return await rpcCall(url, method, params); } catch (e) { lastErr = e; }
+  }
+  throw lastErr || new Error('no rpc');
+}
+
 /* ------------------------------------------------------------------ */
 /* Relay scanner                                                       */
+/*                                                                     */
+/* Failures = requests the Relay API itself marks `failure` OR         */
+/* `refund` (a refund is only issued when the transfer failed).        */
+/* The rate denominator comes from an unfiltered sample of the same    */
+/* window: completed = success + failure + refund. In-flight           */
+/* (waiting/pending/submitted) requests are excluded — they haven't    */
+/* succeeded or failed yet.                                            */
 /* ------------------------------------------------------------------ */
 
-async function scanRelay(lookbackHours) {
-  const since = Math.floor(Date.now() / 1000) - lookbackHours * 3600;
+function relayOriginChain(r) {
+  return r.originChainId
+    ?? r.data?.originChainId
+    ?? r.data?.inTxs?.[0]?.chainId
+    ?? 'unknown';
+}
+
+async function relayCountStatus(status, since) {
   const counts = {};
   let total = 0;
   let continuation = null;
+  let truncated = true;
 
-  for (let page = 0; page < RELAY_MAX_PAGES; page++) {
-    let url = `https://api.relay.link/requests/v2?status=failure&limit=50&startTimestamp=${since}`;
+  for (let page = 0; page < RELAY_FAIL_PAGES_MAX; page++) {
+    let url = `${RELAY_API}?status=${status}&limit=${RELAY_PAGE_LIMIT}&startTimestamp=${since}`;
     if (continuation) url += `&continuation=${encodeURIComponent(continuation)}`;
-    const json = await fetchJson(url, { timeoutMs: 15_000 });
+    const json = await fetchJson(url, { timeoutMs: API_TIMEOUT_MS });
 
     const results = json.requests || json.results || (Array.isArray(json.data) ? json.data : []) || [];
     for (const r of results) {
-      const cid = r.originChainId
-        ?? r.data?.originChainId
-        ?? r.data?.inTxs?.[0]?.chainId;
-      const key = cid ?? 'unknown';
+      const key = relayOriginChain(r);
       counts[key] = (counts[key] || 0) + 1;
       total++;
     }
 
     continuation = json.continuation ?? json.data?.continuation ?? null;
-    if (!continuation || results.length === 0) break;
+    if (!continuation || results.length === 0) { truncated = false; break; }
   }
 
-  return { total, counts };
+  return { total, counts, truncated };
+}
+
+async function relaySample(since) {
+  let completed = 0;
+  let failed = 0;
+  let sampled = 0;
+  let continuation = null;
+  let complete = false;
+
+  for (let page = 0; page < RELAY_SAMPLE_PAGES_MAX; page++) {
+    let url = `${RELAY_API}?limit=${RELAY_PAGE_LIMIT}&startTimestamp=${since}`;
+    if (continuation) url += `&continuation=${encodeURIComponent(continuation)}`;
+    const json = await fetchJson(url, { timeoutMs: API_TIMEOUT_MS });
+
+    const results = json.requests || json.results || (Array.isArray(json.data) ? json.data : []) || [];
+    for (const r of results) {
+      sampled++;
+      const s = String(r.status || '').toLowerCase();
+      if (s === 'success' || s === 'failure' || s === 'refund') {
+        completed++;
+        if (s !== 'success') failed++;
+      }
+    }
+
+    continuation = json.continuation ?? json.data?.continuation ?? null;
+    if (!continuation || results.length === 0) { complete = true; break; }
+  }
+
+  return { completed, failed, sampled, complete };
+}
+
+async function scanRelay(lookbackHours) {
+  const since = Math.floor(Date.now() / 1000) - lookbackHours * 3600;
+
+  const [failure, refund, sample] = await Promise.all([
+    relayCountStatus('failure', since),
+    relayCountStatus('refund', since),
+    relaySample(since),
+  ]);
+
+  const counts = { ...failure.counts };
+  for (const [k, n] of Object.entries(refund.counts)) counts[k] = (counts[k] || 0) + n;
+
+  return {
+    total: failure.total + refund.total,
+    truncated: failure.truncated || refund.truncated,
+    counts,
+    sample,
+  };
 }
 
 /* ------------------------------------------------------------------ */
 /* Across scanner                                                      */
 /* ------------------------------------------------------------------ */
 
-async function fetchAcrossChainNames() {
+const spokePoolCache = new Map(); // chainId -> address | null (immutable registry, cached per session)
+
+async function fetchAcrossChains() {
   try {
-    const json = await fetchJson('https://app.across.to/api/swap/chains', { timeoutMs: 15_000 });
+    const json = await fetchJson(`${ACROSS_API_HOSTS[0]}/swap/chains`, { timeoutMs: API_TIMEOUT_MS });
     const list = Array.isArray(json) ? json : (json.chains || []);
-    const names = {};
+    const chains = [];
     for (const c of list) {
-      if (c && c.chainId != null && c.name) names[c.chainId] = c.name;
+      if (!c || c.chainId == null) continue;
+      const rpcs = [c.publicRpcUrl, FALLBACK_RPCS[c.chainId]].filter(Boolean);
+      if (rpcs.length === 0) continue; // no EVM RPC — non-EVM or unknown chain
+      chains.push({ id: Number(c.chainId), name: c.name, rpcs: [...new Set(rpcs)] });
     }
-    return names;
+    if (chains.length > 0) return chains;
+  } catch { /* fall through to hardcoded fallback */ }
+  return Object.entries(FALLBACK_RPCS).map(([id, rpc]) => ({ id: Number(id), name: null, rpcs: [rpc] }));
+}
+
+async function resolveSpokePool(chainId) {
+  if (spokePoolCache.has(chainId)) return spokePoolCache.get(chainId);
+  const data = hubIface.encodeFunctionData('crossChainContracts', [chainId]);
+  try {
+    const ret = await rpcAny(ETH_RPCS, 'eth_call', [{ to: HUBPOOL, data }, 'latest']);
+    const decoded = hubIface.decodeFunctionResult('crossChainContracts', ret);
+    const spokePool = decoded.spokePool === ethers.constants.AddressZero ? null : decoded.spokePool;
+    spokePoolCache.set(chainId, spokePool);
+    return spokePool;
   } catch {
-    return {};
+    return undefined; // transient failure — retry next refresh, don't cache
   }
 }
 
-async function scanAcrossChain(chain, lookbackHours) {
-  const nowSec = Math.floor(Date.now() / 1000);
-  const latestHex = await rpcCall(chain.rpc, 'eth_blockNumber', []);
-  const latest = parseInt(latestHex, 16);
-  const lookbackBlocks = Math.max(1, Math.round(chain.blocksPerHour * lookbackHours));
-  const floor = Math.max(0, latest - lookbackBlocks);
+// Locate the first block at-or-after targetTs by interpolation search (±90s).
+async function findFloorBlock(rpcs, latest, latestTs, targetTs) {
+  if (latestTs <= targetTs) return latest;
+  let guess = latest - Math.ceil((latestTs - targetTs) / 2); // 2s/block starting guess
+  for (let i = 0; i < 6; i++) {
+    guess = Math.min(latest - 1, Math.max(1, guess));
+    const block = await rpcAny(rpcs, 'eth_getBlockByNumber', ['0x' + guess.toString(16), false]);
+    const ts = parseInt(block.timestamp, 16);
+    const diff = ts - targetTs;
+    if (Math.abs(diff) <= 90) return guess;
+    const secPerBlock = Math.max(0.05, (latestTs - ts) / Math.max(1, latest - guess));
+    guess -= Math.round(diff / secPerBlock);
+  }
+  return Math.max(1, Math.min(latest, guess));
+}
 
-  // Walk backward from the tip in fixed-size pages, never past the lookback floor.
-  const candidates = [];
+async function scanAcrossChain(chain, sinceTs) {
+  const spokePool = await resolveSpokePool(chain.id);
+  if (spokePool === null) return { skipped: true };        // not registered in the HubPool
+  if (spokePool === undefined) throw new Error('spoke pool unresolved');
+
+  const latestHex = await rpcAny(chain.rpcs, 'eth_blockNumber', []);
+  const latest = parseInt(latestHex, 16);
+  const latestBlock = await rpcAny(chain.rpcs, 'eth_getBlockByNumber', ['0x' + latest.toString(16), false]);
+  const latestTs = parseInt(latestBlock.timestamp, 16);
+  const floor = await findFloorBlock(chain.rpcs, latest, latestTs, sinceTs);
+
+  const deposits = [];
+  const fillKeys = [];
+  const slowFillKeys = [];
+  let truncated = false;
+
   let toBlock = latest;
-  for (let page = 0; page < ACROSS_PAGES_PER_CHAIN && toBlock > floor; page++) {
-    const fromBlock = Math.max(floor, toBlock - ACROSS_BLOCKS_PER_PAGE + 1);
+  let chunkSize = LOG_CHUNK_BLOCKS;
+  let chunksUsed = 0;
+  while (toBlock >= floor) {
+    if (chunksUsed >= MAX_CHUNKS_PER_CHAIN) { truncated = true; break; }
+    const fromBlock = Math.max(floor, toBlock - chunkSize + 1);
     let logs;
     try {
-      logs = await rpcCall(chain.rpc, 'eth_getLogs', [{
-        address: chain.spokePool,
-        topics: [DEPOSIT_TOPIC],
+      // Address-only filter: one query captures deposits, fills, and
+      // slow-fill requests, and stays robust to event-signature drift.
+      logs = await rpcAny(chain.rpcs, 'eth_getLogs', [{
+        address: spokePool,
         fromBlock: '0x' + fromBlock.toString(16),
         toBlock: '0x' + toBlock.toString(16),
       }]);
-    } catch {
-      break;
+    } catch (e) {
+      if (chunkSize > 500) { chunkSize = Math.max(500, Math.floor(chunkSize / 4)); continue; }
+      throw e;
     }
+    chunksUsed++;
     for (const log of logs) {
-      try {
-        const parsed = depositIface.parseLog(log);
-        const fillDeadline = Number(parsed.args.fillDeadline);
-        if (fillDeadline < nowSec) {
-          candidates.push(Number(parsed.args.depositId));
-        }
-      } catch { /* non-matching log shape */ }
+      const t0 = log.topics[0];
+      if (TOPIC.deposits.includes(t0)) {
+        try {
+          const parsed = acrossIface.parseLog(log);
+          deposits.push({
+            originChainId: chain.id,
+            depositId: parsed.args.depositId.toString(),
+            destinationChainId: parsed.args.destinationChainId.toString(),
+            quoteTimestamp: Number(parsed.args.quoteTimestamp),
+            fillDeadline: Number(parsed.args.fillDeadline),
+          });
+        } catch { /* unparseable log — skip */ }
+      } else if (TOPIC.fills.includes(t0)) {
+        fillKeys.push(`${BigInt(log.topics[1])}-${BigInt(log.topics[2])}`);
+      } else if (TOPIC.slowFills.includes(t0)) {
+        slowFillKeys.push(`${BigInt(log.topics[1])}-${BigInt(log.topics[2])}`);
+      }
     }
     toBlock = fromBlock - 1;
   }
 
-  // Verify past-deadline deposits against the status API, capped per chain.
-  let failures = 0;
-  for (const depositId of candidates.slice(0, ACROSS_STATUS_CHECK_CAP)) {
+  return { deposits, fillKeys, slowFillKeys, truncated };
+}
+
+async function acrossDepositStatus(originChainId, depositId) {
+  for (const host of ACROSS_API_HOSTS) {
     try {
       const json = await fetchJson(
-        `https://app.across.to/api/deposit/status?depositId=${depositId}&originChainId=${chain.id}`,
+        `${host}/deposit/status?originChainId=${originChainId}&depositId=${depositId}`,
         { timeoutMs: RPC_TIMEOUT_MS },
       );
       const status = String(json.status || '').toLowerCase();
-      if (status === 'expired' || status === 'refunded' || status === 'pending') failures++;
-    } catch { /* status check failed — don't count */ }
+      if (status) return status;
+    } catch { /* try next host */ }
   }
-  return failures;
+  return null;
 }
 
 async function scanAcross(lookbackHours, onProgress) {
-  if (!DEPOSIT_TOPIC) throw new Error('ethers unavailable');
-  const apiNames = await fetchAcrossChainNames();
-  // Cross-reference: scan the hardcoded chains, restricted to those the Swap
-  // API confirms (scan everything if the chain list is unavailable).
-  const apiIds = new Set(Object.keys(apiNames).map(Number));
-  const scannable = apiIds.size > 0
-    ? ACROSS_CHAINS.filter((c) => apiIds.has(c.id))
-    : ACROSS_CHAINS;
+  if (!acrossIface) throw new Error('ethers unavailable');
+  const nowSec = Math.floor(Date.now() / 1000);
+  const sinceTs = nowSec - lookbackHours * 3600;
 
-  const counts = {};
+  const chains = await fetchAcrossChains();
+  const names = {};
+  for (const c of chains) if (c.name) names[c.id] = c.name;
+
   let done = 0;
-  onProgress(done, scannable.length);
+  onProgress(done, chains.length);
 
-  const queue = scannable.slice();
-  const CONCURRENCY = 5;
-  const workers = Array.from({ length: CONCURRENCY }, async () => {
+  const allDeposits = [];
+  const filledKeys = new Set();  // fills + slow-fill requests both mean the user gets funds
+  const scannedChains = new Set();
+  const truncatedChains = [];
+  const failedChains = [];
+
+  const queue = chains.slice();
+  const workers = Array.from({ length: SCAN_CONCURRENCY }, async () => {
     for (;;) {
       const chain = queue.shift();
       if (!chain) return;
-      let n = 0;
       try {
-        n = await scanAcrossChain(chain, lookbackHours);
-      } catch { /* chain unreachable — count nothing */ }
-      if (n > 0) counts[chain.id] = (counts[chain.id] || 0) + n;
+        const res = await scanAcrossChain(chain, sinceTs);
+        if (!res.skipped) {
+          scannedChains.add(String(chain.id));
+          for (const d of res.deposits) {
+            if (d.quoteTimestamp >= sinceTs - QUOTE_TS_SLACK) allDeposits.push(d);
+          }
+          for (const k of res.fillKeys) filledKeys.add(k);
+          for (const k of res.slowFillKeys) filledKeys.add(k);
+          if (res.truncated) truncatedChains.push(chain.id);
+        }
+      } catch {
+        failedChains.push(chain.id);
+      }
       done++;
-      onProgress(done, scannable.length);
+      onProgress(done, chains.length);
     }
   });
   await Promise.all(workers);
 
-  const total = Object.values(counts).reduce((a, b) => a + b, 0);
-  return { total, counts, names: apiNames };
+  // Classify. A deposit is "decided" once its fill deadline has passed:
+  // fills are impossible afterwards, so unmatched === failed.
+  const decided = allDeposits.filter((d) => d.fillDeadline < nowSec);
+  const undecided = allDeposits.length - decided.length;
+
+  // Sanity guard: if we saw deposits but not a single fill anywhere, the
+  // fill-event decoding is broken (or every RPC dropped logs) — don't
+  // declare mass failure from that; verify via API instead.
+  const fillSignalOk = filledKeys.size > 0 || decided.length === 0;
+
+  const perChain = {}; // originChainId -> { failed, decided }
+  const bump = (id, isFailure) => {
+    const rec = (perChain[id] ||= { failed: 0, decided: 0 });
+    rec.decided++;
+    if (isFailure) rec.failed++;
+  };
+
+  const needsVerify = [];
+  let failures = 0;
+  let successes = 0;
+
+  for (const d of decided) {
+    const key = `${d.originChainId}-${d.depositId}`;
+    const destScanned = scannedChains.has(d.destinationChainId);
+    if (filledKeys.has(key)) {
+      successes++;
+      bump(d.originChainId, false);
+    } else if (fillSignalOk && destScanned) {
+      // On-chain evidence of failure; queue for an API double-check.
+      needsVerify.push({ ...d, presumed: 'failed' });
+    } else {
+      // Destination not scanned (non-EVM / unreachable) — API is the only oracle.
+      needsVerify.push({ ...d, presumed: 'unknown' });
+    }
+  }
+
+  // Newest first so the freshest failures are always verified within the cap.
+  needsVerify.sort((a, b) => b.quoteTimestamp - a.quoteTimestamp);
+  const toCheck = needsVerify.slice(0, STATUS_VERIFY_CAP);
+  const uncheckable = needsVerify.slice(STATUS_VERIFY_CAP);
+
+  let apiErrors = 0; // circuit breaker: stop hammering a dead status API
+  const fallbackVerdict = (d) => (d.presumed === 'failed' ? 'failed' : 'unverified');
+  const verdicts = new Array(toCheck.length);
+  let next = 0;
+  await Promise.all(Array.from({ length: 4 }, async () => {
+    for (;;) {
+      const i = next++;
+      if (i >= toCheck.length) return;
+      const d = toCheck[i];
+      if (apiErrors >= 6) { verdicts[i] = fallbackVerdict(d); continue; }
+      const status = await acrossDepositStatus(d.originChainId, d.depositId);
+      if (status === null) { apiErrors++; verdicts[i] = fallbackVerdict(d); }
+      else if (status === 'filled' || status === 'slowfillrequested') verdicts[i] = 'success';
+      else if (status === 'expired' || status === 'refunded' || status === 'pending') verdicts[i] = 'failed';
+      else verdicts[i] = fallbackVerdict(d);
+    }
+  }));
+
+  let unverified = 0;
+  toCheck.forEach((d, i) => {
+    if (verdicts[i] === 'failed') { failures++; bump(d.originChainId, true); }
+    else if (verdicts[i] === 'success') { successes++; bump(d.originChainId, false); }
+    else unverified++;
+  });
+  for (const d of uncheckable) {
+    if (d.presumed === 'failed') { failures++; bump(d.originChainId, true); }
+    else unverified++;
+  }
+
+  return {
+    failures,
+    decided: failures + successes,
+    undecided,
+    unverified,
+    perChain,
+    names,
+    truncatedChains,
+    failedChains,
+  };
 }
 
 /* ------------------------------------------------------------------ */
@@ -469,14 +757,20 @@ function setCountLoading(id) {
   const node = el(id);
   node.classList.add('loading');
   node.classList.remove('fail', 'ok');
+  node.textContent = '—';
 }
 
-function setCount(id, value) {
+function setRate(id, failed, denominator) {
   const node = el(id);
   node.classList.remove('loading');
-  node.classList.toggle('fail', value > 0);
-  node.classList.toggle('ok', value === 0);
-  node.textContent = String(value);
+  if (denominator > 0) {
+    node.classList.toggle('fail', failed > 0);
+    node.classList.toggle('ok', failed === 0);
+    node.textContent = ((100 * failed) / denominator).toFixed(failed > 0 && (100 * failed) / denominator < 10 ? 1 : 0) + '%';
+  } else {
+    node.classList.remove('fail', 'ok');
+    node.textContent = '—';
+  }
 }
 
 function setCountError(id) {
@@ -493,18 +787,38 @@ function chainName(id, extraNames = {}) {
   return extraNames[id] || CHAIN_NAMES[id] || (id === 'unknown' ? 'Unknown' : `Chain ${id}`);
 }
 
-function renderChainList(containerId, counts, extraNames = {}) {
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
+}
+
+function renderRelayChains(counts) {
   const entries = Object.entries(counts)
     .filter(([, n]) => n > 0)
     .sort((a, b) => b[1] - a[1]);
-  const container = el(containerId);
+  const container = el('relay-chains');
   if (entries.length === 0) {
     container.innerHTML = '<div class="chain-row empty">no failures detected</div>';
     return;
   }
   container.innerHTML = entries.map(([id, n]) => {
+    const name = chainName(/^\d+$/.test(id) ? Number(id) : id);
+    return `<div class="chain-row"><span class="name">${esc(name)}</span><span class="num">${n}</span></div>`;
+  }).join('');
+}
+
+function renderAcrossChains(perChain, extraNames) {
+  const entries = Object.entries(perChain)
+    .filter(([, v]) => v.decided > 0)
+    .sort((a, b) => (b[1].failed - a[1].failed) || (b[1].decided - a[1].decided));
+  const container = el('across-chains');
+  if (entries.length === 0) {
+    container.innerHTML = '<div class="chain-row empty">no decided deposits in window</div>';
+    return;
+  }
+  container.innerHTML = entries.map(([id, v]) => {
     const name = chainName(/^\d+$/.test(id) ? Number(id) : id, extraNames);
-    return `<div class="chain-row"><span class="name">${name}</span><span class="num">${n}</span></div>`;
+    return `<div class="chain-row"><span class="name">${esc(name)}</span>` +
+      `<span class="num">${v.failed}<span class="den"> / ${v.decided}</span></span></div>`;
   }).join('');
 }
 
@@ -522,33 +836,57 @@ async function refreshAll() {
 
   setCountLoading('relay-count');
   setCountLoading('across-count');
-  el('relay-progress').textContent = '';
-  el('across-progress').textContent = '';
+  el('relay-metrics').textContent = '';
+  el('across-metrics').textContent = '';
+  el('relay-note').textContent = '';
+  el('across-note').textContent = '';
   renderSkeleton('relay-chains');
   renderSkeleton('across-chains');
 
   const relayJob = scanRelay(hours).then((res) => {
     if (token !== runToken) return;
-    setCount('relay-count', res.total);
-    renderChainList('relay-chains', res.counts);
+    const { sample } = res;
+    setRate('relay-count', sample.failed, sample.completed);
+    const countLabel = res.truncated ? `${res.total}+` : String(res.total);
+    el('relay-metrics').textContent = sample.completed > 0
+      ? `${countLabel} failed · ${sample.failed}/${sample.completed} of ${sample.complete ? 'window' : `last ${sample.sampled}`}`
+      : `${countLabel} failed · no completed requests sampled`;
+    const notes = [];
+    if (res.truncated) notes.push('failure count capped');
+    if (!sample.complete) notes.push(`rate from most recent ${sample.sampled} requests`);
+    el('relay-note').textContent = notes.join(' · ');
+    renderRelayChains(res.counts);
   }).catch(() => {
     if (token !== runToken) return;
     setCountError('relay-count');
+    el('relay-note').textContent = 'relay api unreachable';
     el('relay-chains').innerHTML = '<div class="chain-row empty">unavailable</div>';
   });
 
   const acrossJob = scanAcross(hours, (done, totalChains) => {
     if (token !== runToken) return;
-    el('across-progress').textContent =
-      done < totalChains ? `scanning ${done}/${totalChains}...` : '';
+    el('across-metrics').textContent =
+      done < totalChains ? `scanning ${done}/${totalChains} chains...` : 'classifying...';
   }).then((res) => {
     if (token !== runToken) return;
-    setCount('across-count', res.total);
-    renderChainList('across-chains', res.counts, res.names);
+    setRate('across-count', res.failures, res.decided);
+    el('across-metrics').textContent =
+      `${res.failures} unfilled / ${res.decided} decided · ${res.undecided} still in flight`;
+    const notes = [];
+    if (res.unverified > 0) notes.push(`${res.unverified} unverifiable (excluded)`);
+    if (res.truncatedChains.length > 0) {
+      notes.push(`window truncated: ${res.truncatedChains.map((id) => chainName(id, res.names)).join(', ')}`);
+    }
+    if (res.failedChains.length > 0) {
+      notes.push(`unreachable: ${res.failedChains.map((id) => chainName(id, res.names)).join(', ')}`);
+    }
+    el('across-note').textContent = notes.join(' · ');
+    renderAcrossChains(res.perChain, res.names);
   }).catch(() => {
     if (token !== runToken) return;
     setCountError('across-count');
-    el('across-progress').textContent = '';
+    el('across-metrics').textContent = '';
+    el('across-note').textContent = 'scan unavailable';
     el('across-chains').innerHTML = '<div class="chain-row empty">unavailable</div>';
   });
 
