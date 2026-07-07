@@ -73,6 +73,13 @@
     margin-bottom: 40px;
   }
   @media (max-width: 640px) { .heroes { grid-template-columns: 1fr; } }
+  .cap-note {
+    margin-top: -28px;
+    margin-bottom: 34px;
+    font-size: 11px;
+    color: var(--ink-muted);
+    text-align: center;
+  }
   .card {
     background: var(--surface);
     border-radius: 14px;
@@ -105,6 +112,16 @@
   }
   .count.fail { color: var(--fail); }
   .count.ok   { color: var(--ok); }
+  .rate {
+    margin-top: 8px;
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--ink-muted);
+    font-variant-numeric: tabular-nums;
+    min-height: 18px;
+  }
+  .rate.fail { color: var(--fail); }
+  .rate.ok   { color: var(--ok); }
   .count.loading {
     animation: shimmer-pulse 1.4s ease-in-out infinite;
   }
@@ -223,6 +240,7 @@
         <span class="proto-name">Relay</span>
       </div>
       <div class="count loading" id="relay-count">—</div>
+      <div class="rate" id="relay-rate"></div>
       <div class="metrics" id="relay-metrics"></div>
       <div class="note muted" id="relay-note"></div>
       <div class="card-sub">failed + refunded / completed requests</div>
@@ -243,11 +261,14 @@
         <span class="proto-name">Across</span>
       </div>
       <div class="count loading" id="across-count">—</div>
+      <div class="rate" id="across-rate"></div>
       <div class="metrics" id="across-metrics"></div>
       <div class="note muted" id="across-note"></div>
       <div class="card-sub">expired + refunded / settled deposits (sampled)</div>
     </div>
   </div>
+
+  <div class="cap-note">Failure counter is capped at 500 — higher counts display as “500+”.</div>
 
   <div class="breakdown">
     <div class="col relay-col">
@@ -289,6 +310,7 @@
 const REFRESH_MS = 120_000;
 const RPC_TIMEOUT_MS = 10_000;
 const API_TIMEOUT_MS = 15_000;
+const COUNT_CAP = 500;              // headline failure counter is capped for display; shows "500+" beyond this
 
 const RELAY_API = 'https://api.relay.link/requests/v2';
 const RELAY_PAGE_LIMIT = 50;
@@ -734,16 +756,25 @@ function setCountLoading(id) {
   node.textContent = '—';
 }
 
-function setRate(id, failed, denominator) {
-  const node = el(id);
-  node.classList.remove('loading');
+/* Big number = total failed + reverted transactions (capped at COUNT_CAP).  */
+/* Small line underneath = failure rate as a percentage.                     */
+function setRate(countId, rateId, count, failed, denominator) {
+  const countNode = el(countId);
+  const rateNode = el(rateId);
+  countNode.classList.remove('loading');
+  countNode.classList.toggle('fail', count > 0);
+  countNode.classList.toggle('ok', count === 0);
+  countNode.textContent = count > COUNT_CAP ? COUNT_CAP + '+' : String(count);
+
   if (denominator > 0) {
-    node.classList.toggle('fail', failed > 0);
-    node.classList.toggle('ok', failed === 0);
-    node.textContent = ((100 * failed) / denominator).toFixed(failed > 0 && (100 * failed) / denominator < 10 ? 1 : 0) + '%';
+    const pct = (100 * failed) / denominator;
+    const pctText = pct.toFixed(failed > 0 && pct < 10 ? 1 : 0) + '%';
+    rateNode.classList.toggle('fail', failed > 0);
+    rateNode.classList.toggle('ok', failed === 0);
+    rateNode.textContent = `${pctText} failure rate`;
   } else {
-    node.classList.remove('fail', 'ok');
-    node.textContent = '—';
+    rateNode.classList.remove('fail', 'ok');
+    rateNode.textContent = '';
   }
 }
 
@@ -810,6 +841,8 @@ async function refreshAll() {
 
   setCountLoading('relay-count');
   setCountLoading('across-count');
+  el('relay-rate').textContent = '';
+  el('across-rate').textContent = '';
   el('relay-metrics').textContent = '';
   el('across-metrics').textContent = '';
   el('relay-note').textContent = '';
@@ -820,11 +853,10 @@ async function refreshAll() {
   const relayJob = scanRelay(hours).then((res) => {
     if (token !== runToken) return;
     const { sample } = res;
-    setRate('relay-count', sample.failed, sample.completed);
-    const countLabel = res.truncated ? `${res.total}+` : String(res.total);
+    setRate('relay-count', 'relay-rate', res.total, sample.failed, sample.completed);
     el('relay-metrics').textContent = sample.completed > 0
-      ? `${countLabel} failed · ${sample.failed}/${sample.completed} of ${sample.complete ? 'window' : `last ${sample.sampled}`}`
-      : `${countLabel} failed · no completed requests sampled`;
+      ? `rate from ${sample.failed}/${sample.completed} ${sample.complete ? 'in window' : `of last ${sample.sampled}`}`
+      : 'no completed requests sampled for rate';
     const notes = [];
     if (res.truncated) notes.push('failure count capped');
     if (!sample.complete) notes.push(`rate from most recent ${sample.sampled} requests`);
@@ -833,6 +865,7 @@ async function refreshAll() {
   }).catch(() => {
     if (token !== runToken) return;
     setCountError('relay-count');
+    el('relay-rate').textContent = '';
     el('relay-note').textContent = 'relay api unreachable';
     el('relay-chains').innerHTML = '<div class="chain-row empty">unavailable</div>';
   });
@@ -843,9 +876,9 @@ async function refreshAll() {
       done < totalChains ? `scanning ${done}/${totalChains} chains...` : 'classifying...';
   }).then((res) => {
     if (token !== runToken) return;
-    setRate('across-count', res.failures, res.decided);
+    setRate('across-count', 'across-rate', res.failures, res.failures, res.decided);
     el('across-metrics').textContent = res.decided > 0
-      ? `${res.failures} failed / ${res.decided} settled · ${res.inFlight} in flight`
+      ? `${res.decided} settled · ${res.inFlight} in flight`
       : `no settled deposits sampled · ${res.inFlight} in flight`;
     const notes = [];
     if (res.truncated) notes.push(`rate from most recent ${res.sampled} deposits`);
@@ -861,6 +894,7 @@ async function refreshAll() {
   }).catch(() => {
     if (token !== runToken) return;
     setCountError('across-count');
+    el('across-rate').textContent = '';
     el('across-metrics').textContent = '';
     el('across-note').textContent = 'scan unavailable';
     el('across-chains').innerHTML = '<div class="chain-row empty">unavailable</div>';
