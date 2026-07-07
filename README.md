@@ -28,24 +28,29 @@ silently counted (or dropped).
 
 ### Across
 
-- **Deposits** — `FundsDeposited` events scanned from every EVM SpokePool via
-  public RPCs. SpokePool addresses are resolved live from the HubPool registry
-  (`crossChainContracts`) on Ethereum — nothing hardcoded to go stale. Both
-  event generations (`V3FundsDeposited` and the post-migration bytes32
-  `FundsDeposited`) are recognized. The scan window is located by block
-  timestamp search, not a fixed blocks-per-hour estimate, and deposits are
-  filtered by their `quoteTimestamp`.
-- **Outcomes** — deposits are matched against `FilledRelay` / slow-fill events
-  on their destination chain. A deposit only counts once its **fill deadline**
-  has passed ("decided"); after the deadline a fill is impossible on-chain, so
-  unmatched = failed (it will be expired/refunded). Apparent failures are
-  double-checked against the `deposit/status` API. Deposits whose deadline
-  hasn't passed are "in flight"; deposits that can't be verified (e.g. non-EVM
-  destination and status API unreachable) are excluded from the rate and
-  surfaced as "unverifiable".
-- **Coverage caveats are visible** — chains whose RPC is unreachable or whose
-  scan window was truncated are listed on the card instead of silently
-  reporting zero.
+- **Deposits** — `FundsDeposited` events are enumerated from every EVM
+  SpokePool via public RPCs. SpokePool addresses are resolved live from the
+  HubPool registry (`crossChainContracts`) on Ethereum — nothing hardcoded to
+  go stale. Both event generations (`V3FundsDeposited` and the post-migration
+  bytes32 `FundsDeposited`) are recognized. The scan window is located by block
+  timestamp search, not a fixed blocks-per-hour estimate.
+- **Outcomes come from the status API, never from missing logs** — a sample of
+  the most-recent settled deposits is classified directly by the
+  `deposit/status` API: `filled`/`slowFilled` = success, `expired`/`refunded` =
+  failed. This is the key correctness property: a successful fill the scanner
+  didn't happen to observe on-chain can **never** be miscounted as a failure,
+  because failure is only ever asserted by the API, not inferred from absence.
+  (An earlier version matched fill logs and treated "no fill seen" as failure;
+  destination-chain fills fell outside the per-chain block window on fast
+  chains, producing a wildly inflated ~19% rate.)
+- **What's excluded from the rate** — deposits too fresh to have settled
+  (younger than a short buffer), deposits the API still reports as in-flight,
+  and deposits it can't classify. These are reported separately, not counted.
+- **Sampling** — the rate is computed over up to a few hundred of the most
+  recent deposits; when the window holds more, the card labels it as a sample.
+  Chains whose RPC is unreachable or whose enumeration was truncated are listed
+  on the card instead of silently reporting zero. Non-EVM origins (Solana,
+  Tron) are not scanned.
 
 ## Running
 

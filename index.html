@@ -245,7 +245,7 @@
       <div class="count loading" id="across-count">—</div>
       <div class="metrics" id="across-metrics"></div>
       <div class="note muted" id="across-note"></div>
-      <div class="card-sub">unfilled (expired · refunded · stuck) / decided deposits</div>
+      <div class="card-sub">expired + refunded / settled deposits (sampled)</div>
     </div>
   </div>
 
@@ -255,7 +255,7 @@
       <div id="relay-chains"></div>
     </div>
     <div class="col across-col">
-      <div class="col-title"><span class="dot"></span>Across · unfilled / decided by origin chain</div>
+      <div class="col-title"><span class="dot"></span>Across · failed / settled by origin chain</div>
       <div id="across-chains"></div>
     </div>
   </div>
@@ -265,14 +265,16 @@
     <b>failure</b> or <b>refund</b> (both are failed requests — a refund is paid
     because the transfer could not complete), rated against completed requests
     (success + failure + refund); in-flight requests are excluded from the rate.
-    Across: <b>FundsDeposited</b> events are scanned from every EVM SpokePool
-    (addresses resolved live from the HubPool registry) and matched against
-    <b>FilledRelay</b> / slow-fill events. A deposit counts once its fill
-    deadline has passed ("decided"): matched = filled, unmatched = failed
-    (fills are impossible after the deadline). Apparent failures are
-    double-checked against the Across status API. Deposits whose deadline has
-    not passed yet, or that cannot be verified, are excluded from the rate and
-    reported separately. Non-EVM origins (Solana, Tron) are not scanned.
+    Across: <b>FundsDeposited</b> events are enumerated from every EVM SpokePool
+    (addresses resolved live from the HubPool registry), and a sample of the
+    most-recent settled deposits is classified <b>directly by the Across
+    /deposit/status API</b> — <b>filled</b> = success, <b>expired</b> /
+    <b>refunded</b> = failed. Outcomes are never inferred from a missing fill
+    log, so a fill the scanner didn't see can't be miscounted as a failure.
+    Deposits too fresh to have settled, still pending, or unverifiable are
+    excluded from the rate and reported separately. The rate is over a sample
+    (labelled when the window is larger); non-EVM origins (Solana, Tron) aren't
+    scanned.
   </div>
 </div>
 
@@ -297,10 +299,17 @@ const HUBPOOL = '0xc186fA914353c44b2E33eBE05f21846F1048bEda'; // Ethereum mainne
 const ETH_RPCS = ['https://ethereum-rpc.publicnode.com', 'https://eth.drpc.org'];
 const ACROSS_API_HOSTS = ['https://app.across.to/api', 'https://public.api.across.to'];
 const LOG_CHUNK_BLOCKS = 4000;
-const MAX_CHUNKS_PER_CHAIN = 45;    // 180k blocks — covers 24h everywhere except ultra-fast chains
-const STATUS_VERIFY_CAP = 40;       // apparent failures double-checked via status API per refresh
+const MAX_CHUNKS_PER_CHAIN = 60;    // safety bound on log paging per chain per refresh
 const SCAN_CONCURRENCY = 5;
 const QUOTE_TS_SLACK = 300;         // quoteTimestamp lags deposit time by up to a few minutes
+
+// The Across rate is computed over a bounded sample of the most-recent
+// deposits, each classified authoritatively by the /deposit/status API
+// (never inferred from the absence of a fill log). These bound API load.
+const ACROSS_SAMPLE_CAP = 150;      // most-recent deposits status-checked per refresh (global)
+const ACROSS_PER_CHAIN_CAP = 150;   // stop paging a chain once this many recent deposits are collected
+const ACROSS_STATUS_CONCURRENCY = 8;
+const ACROSS_SETTLE_BUFFER = 90;    // ignore deposits younger than this — still settling (~2s fills + API lag)
 
 // Fallback RPCs for when /swap/chains is unreachable or its publicRpcUrl fails.
 const FALLBACK_RPCS = {
@@ -337,33 +346,28 @@ const CHAIN_NAMES = {
 /* ------------------------------------------------------------------ */
 /* Across ABI / topics                                                 */
 /*                                                                     */
-/* SpokePools migrated from the V3* events (address fields, uint32     */
-/* depositId) to bytes32-field events with uint256 depositId. Both     */
-/* generations are recognized so partially-upgraded chains still       */
-/* count. Indexed layout is identical across generations:              */
+/* SpokePools migrated from the V3 deposit event (address fields,      */
+/* uint32 depositId) to a bytes32-field event with uint256 depositId.  */
+/* Both are recognized so partially-upgraded chains still count. We    */
+/* only decode deposits here — each deposit's outcome (filled/expired/ */
+/* refunded) is read from the Across status API, not from fill logs,   */
+/* so no fill-event ABI is needed.                                     */
 /*   deposits: topics = [sig, destinationChainId, depositId, depositor]*/
-/*   fills:    topics = [sig, originChainId, depositId, relayer]       */
 /* ------------------------------------------------------------------ */
 
 const ACROSS_EVENT_ABI = [
   'event FundsDeposited(bytes32 inputToken, bytes32 outputToken, uint256 inputAmount, uint256 outputAmount, uint256 indexed destinationChainId, uint256 indexed depositId, uint32 quoteTimestamp, uint32 fillDeadline, uint32 exclusivityDeadline, bytes32 indexed depositor, bytes32 recipient, bytes32 exclusiveRelayer, bytes message)',
   'event V3FundsDeposited(address inputToken, address outputToken, uint256 inputAmount, uint256 outputAmount, uint256 indexed destinationChainId, uint32 indexed depositId, uint32 quoteTimestamp, uint32 fillDeadline, uint32 exclusivityDeadline, address indexed depositor, address recipient, address exclusiveRelayer, bytes message)',
-  'event FilledRelay(bytes32 inputToken, bytes32 outputToken, uint256 inputAmount, uint256 outputAmount, uint256 repaymentChainId, uint256 indexed originChainId, uint256 indexed depositId, uint32 fillDeadline, uint32 exclusivityDeadline, bytes32 exclusiveRelayer, bytes32 indexed relayer, bytes32 depositor, bytes32 recipient, bytes32 messageHash, (bytes32 updatedRecipient, bytes32 updatedMessageHash, uint256 updatedOutputAmount, uint8 fillType) relayExecutionInfo)',
-  'event FilledV3Relay(address inputToken, address outputToken, uint256 inputAmount, uint256 outputAmount, uint256 repaymentChainId, uint256 indexed originChainId, uint32 indexed depositId, uint32 fillDeadline, uint32 exclusivityDeadline, address exclusiveRelayer, address indexed relayer, address depositor, address recipient, bytes message, (address updatedRecipient, bytes updatedMessage, uint256 updatedOutputAmount, uint8 fillType) relayExecutionInfo)',
-  'event RequestedSlowFill(bytes32 inputToken, bytes32 outputToken, uint256 inputAmount, uint256 outputAmount, uint256 indexed originChainId, uint256 indexed depositId, uint32 quoteTimestamp, uint32 fillDeadline, uint32 exclusivityDeadline, bytes32 depositor, bytes32 recipient, bytes32 exclusiveRelayer, bytes message)',
-  'event RequestedV3SlowFill(address inputToken, address outputToken, uint256 inputAmount, uint256 outputAmount, uint256 indexed originChainId, uint32 indexed depositId, uint32 quoteTimestamp, uint32 fillDeadline, uint32 exclusivityDeadline, address depositor, address recipient, address exclusiveRelayer, bytes message)',
 ];
 const HUBPOOL_ABI = ['function crossChainContracts(uint256 chainId) view returns (address adapter, address spokePool)'];
 
 let acrossIface = null;
 let hubIface = null;
-const TOPIC = { deposits: [], fills: [], slowFills: [] };
+const TOPIC = { deposits: [] };
 try {
   acrossIface = new ethers.utils.Interface(ACROSS_EVENT_ABI);
   hubIface = new ethers.utils.Interface(HUBPOOL_ABI);
   TOPIC.deposits  = [acrossIface.getEventTopic('FundsDeposited'), acrossIface.getEventTopic('V3FundsDeposited')];
-  TOPIC.fills     = [acrossIface.getEventTopic('FilledRelay'), acrossIface.getEventTopic('FilledV3Relay')];
-  TOPIC.slowFills = [acrossIface.getEventTopic('RequestedSlowFill'), acrossIface.getEventTopic('RequestedV3SlowFill')];
 } catch { /* ethers CDN unavailable — Across scan disabled, Relay still works */ }
 
 /* ------------------------------------------------------------------ */
@@ -558,23 +562,26 @@ async function scanAcrossChain(chain, sinceTs) {
   const latestTs = parseInt(latestBlock.timestamp, 16);
   const floor = await findFloorBlock(chain.rpcs, latest, latestTs, sinceTs);
 
+  // Enumerate the origin-chain deposit events in the window. We only need
+  // to *list* deposits here — their outcome is decided by the status API,
+  // not by matching fill logs (fills live on the destination chain and
+  // can't be reliably matched from a per-chain window). Scan newest→oldest
+  // and stop early once we have enough recent deposits for the sample.
   const deposits = [];
-  const fillKeys = [];
-  const slowFillKeys = [];
   let truncated = false;
 
   let toBlock = latest;
   let chunkSize = LOG_CHUNK_BLOCKS;
   let chunksUsed = 0;
   while (toBlock >= floor) {
+    if (deposits.length >= ACROSS_PER_CHAIN_CAP) break;
     if (chunksUsed >= MAX_CHUNKS_PER_CHAIN) { truncated = true; break; }
     const fromBlock = Math.max(floor, toBlock - chunkSize + 1);
     let logs;
     try {
-      // Address-only filter: one query captures deposits, fills, and
-      // slow-fill requests, and stays robust to event-signature drift.
       logs = await rpcAny(chain.rpcs, 'eth_getLogs', [{
         address: spokePool,
+        topics: [TOPIC.deposits],   // OR-match both deposit event generations
         fromBlock: '0x' + fromBlock.toString(16),
         toBlock: '0x' + toBlock.toString(16),
       }]);
@@ -584,28 +591,21 @@ async function scanAcrossChain(chain, sinceTs) {
     }
     chunksUsed++;
     for (const log of logs) {
-      const t0 = log.topics[0];
-      if (TOPIC.deposits.includes(t0)) {
-        try {
-          const parsed = acrossIface.parseLog(log);
-          deposits.push({
-            originChainId: chain.id,
-            depositId: parsed.args.depositId.toString(),
-            destinationChainId: parsed.args.destinationChainId.toString(),
-            quoteTimestamp: Number(parsed.args.quoteTimestamp),
-            fillDeadline: Number(parsed.args.fillDeadline),
-          });
-        } catch { /* unparseable log — skip */ }
-      } else if (TOPIC.fills.includes(t0)) {
-        fillKeys.push(`${BigInt(log.topics[1])}-${BigInt(log.topics[2])}`);
-      } else if (TOPIC.slowFills.includes(t0)) {
-        slowFillKeys.push(`${BigInt(log.topics[1])}-${BigInt(log.topics[2])}`);
-      }
+      try {
+        const parsed = acrossIface.parseLog(log);
+        deposits.push({
+          originChainId: chain.id,
+          depositId: parsed.args.depositId.toString(),
+          destinationChainId: parsed.args.destinationChainId.toString(),
+          quoteTimestamp: Number(parsed.args.quoteTimestamp),
+          fillDeadline: Number(parsed.args.fillDeadline),
+        });
+      } catch { /* unparseable log — skip */ }
     }
     toBlock = fromBlock - 1;
   }
 
-  return { deposits, fillKeys, slowFillKeys, truncated };
+  return { deposits, truncated };
 }
 
 async function acrossDepositStatus(originChainId, depositId) {
@@ -635,8 +635,6 @@ async function scanAcross(lookbackHours, onProgress) {
   onProgress(done, chains.length);
 
   const allDeposits = [];
-  const filledKeys = new Set();  // fills + slow-fill requests both mean the user gets funds
-  const scannedChains = new Set();
   const truncatedChains = [];
   const failedChains = [];
 
@@ -648,12 +646,9 @@ async function scanAcross(lookbackHours, onProgress) {
       try {
         const res = await scanAcrossChain(chain, sinceTs);
         if (!res.skipped) {
-          scannedChains.add(String(chain.id));
           for (const d of res.deposits) {
             if (d.quoteTimestamp >= sinceTs - QUOTE_TS_SLACK) allDeposits.push(d);
           }
-          for (const k of res.fillKeys) filledKeys.add(k);
-          for (const k of res.slowFillKeys) filledKeys.add(k);
           if (res.truncated) truncatedChains.push(chain.id);
         }
       } catch {
@@ -665,15 +660,15 @@ async function scanAcross(lookbackHours, onProgress) {
   });
   await Promise.all(workers);
 
-  // Classify. A deposit is "decided" once its fill deadline has passed:
-  // fills are impossible afterwards, so unmatched === failed.
-  const decided = allDeposits.filter((d) => d.fillDeadline < nowSec);
-  const undecided = allDeposits.length - decided.length;
-
-  // Sanity guard: if we saw deposits but not a single fill anywhere, the
-  // fill-event decoding is broken (or every RPC dropped logs) — don't
-  // declare mass failure from that; verify via API instead.
-  const fillSignalOk = filledKeys.size > 0 || decided.length === 0;
+  // Build the sample: the most-recent deposits old enough to have settled.
+  // The status API — not the absence of a fill log — decides each outcome,
+  // so no successful fill can ever be miscounted as a failure.
+  const settleBefore = nowSec - ACROSS_SETTLE_BUFFER;
+  const sample = allDeposits
+    .filter((d) => d.quoteTimestamp <= settleBefore)
+    .sort((a, b) => b.quoteTimestamp - a.quoteTimestamp)
+    .slice(0, ACROSS_SAMPLE_CAP);
+  const inFlight = allDeposits.length - sample.length; // too fresh to classify yet
 
   const perChain = {}; // originChainId -> { failed, decided }
   const bump = (id, isFailure) => {
@@ -682,64 +677,43 @@ async function scanAcross(lookbackHours, onProgress) {
     if (isFailure) rec.failed++;
   };
 
-  const needsVerify = [];
   let failures = 0;
   let successes = 0;
+  let pending = 0;     // API still reports in-flight — excluded from the rate
+  let unverified = 0;  // API unreachable/unknown — excluded from the rate
+  let apiErrors = 0;   // circuit breaker: stop hammering a dead status API
 
-  for (const d of decided) {
-    const key = `${d.originChainId}-${d.depositId}`;
-    const destScanned = scannedChains.has(d.destinationChainId);
-    if (filledKeys.has(key)) {
-      successes++;
-      bump(d.originChainId, false);
-    } else if (fillSignalOk && destScanned) {
-      // On-chain evidence of failure; queue for an API double-check.
-      needsVerify.push({ ...d, presumed: 'failed' });
-    } else {
-      // Destination not scanned (non-EVM / unreachable) — API is the only oracle.
-      needsVerify.push({ ...d, presumed: 'unknown' });
-    }
-  }
-
-  // Newest first so the freshest failures are always verified within the cap.
-  needsVerify.sort((a, b) => b.quoteTimestamp - a.quoteTimestamp);
-  const toCheck = needsVerify.slice(0, STATUS_VERIFY_CAP);
-  const uncheckable = needsVerify.slice(STATUS_VERIFY_CAP);
-
-  let apiErrors = 0; // circuit breaker: stop hammering a dead status API
-  const fallbackVerdict = (d) => (d.presumed === 'failed' ? 'failed' : 'unverified');
-  const verdicts = new Array(toCheck.length);
+  const verdicts = new Array(sample.length);
   let next = 0;
-  await Promise.all(Array.from({ length: 4 }, async () => {
+  await Promise.all(Array.from({ length: ACROSS_STATUS_CONCURRENCY }, async () => {
     for (;;) {
       const i = next++;
-      if (i >= toCheck.length) return;
-      const d = toCheck[i];
-      if (apiErrors >= 6) { verdicts[i] = fallbackVerdict(d); continue; }
+      if (i >= sample.length) return;
+      if (apiErrors >= 8) { verdicts[i] = 'unverified'; continue; }
+      const d = sample[i];
       const status = await acrossDepositStatus(d.originChainId, d.depositId);
-      if (status === null) { apiErrors++; verdicts[i] = fallbackVerdict(d); }
-      else if (status === 'filled' || status === 'slowfillrequested') verdicts[i] = 'success';
-      else if (status === 'expired' || status === 'refunded' || status === 'pending') verdicts[i] = 'failed';
-      else verdicts[i] = fallbackVerdict(d);
+      if (status === null) { apiErrors++; verdicts[i] = 'unverified'; }
+      else if (status === 'filled' || status === 'slowfilled' || status === 'slowfillrequested') verdicts[i] = 'success';
+      else if (status === 'expired' || status === 'refunded') verdicts[i] = 'failed';
+      else verdicts[i] = 'pending'; // 'pending', 'deposited', or anything else = still in flight
     }
   }));
 
-  let unverified = 0;
-  toCheck.forEach((d, i) => {
-    if (verdicts[i] === 'failed') { failures++; bump(d.originChainId, true); }
-    else if (verdicts[i] === 'success') { successes++; bump(d.originChainId, false); }
+  sample.forEach((d, i) => {
+    const v = verdicts[i];
+    if (v === 'failed') { failures++; bump(d.originChainId, true); }
+    else if (v === 'success') { successes++; bump(d.originChainId, false); }
+    else if (v === 'pending') pending++;
     else unverified++;
   });
-  for (const d of uncheckable) {
-    if (d.presumed === 'failed') { failures++; bump(d.originChainId, true); }
-    else unverified++;
-  }
 
   return {
     failures,
     decided: failures + successes,
-    undecided,
+    inFlight: inFlight + pending,
     unverified,
+    sampled: sample.length,
+    truncated: allDeposits.length >= sample.length && sample.length === ACROSS_SAMPLE_CAP,
     perChain,
     names,
     truncatedChains,
@@ -870,9 +844,11 @@ async function refreshAll() {
   }).then((res) => {
     if (token !== runToken) return;
     setRate('across-count', res.failures, res.decided);
-    el('across-metrics').textContent =
-      `${res.failures} unfilled / ${res.decided} decided · ${res.undecided} still in flight`;
+    el('across-metrics').textContent = res.decided > 0
+      ? `${res.failures} failed / ${res.decided} settled · ${res.inFlight} in flight`
+      : `no settled deposits sampled · ${res.inFlight} in flight`;
     const notes = [];
+    if (res.truncated) notes.push(`rate from most recent ${res.sampled} deposits`);
     if (res.unverified > 0) notes.push(`${res.unverified} unverifiable (excluded)`);
     if (res.truncatedChains.length > 0) {
       notes.push(`window truncated: ${res.truncatedChains.map((id) => chainName(id, res.names)).join(', ')}`);
