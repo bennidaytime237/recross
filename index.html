@@ -320,6 +320,8 @@ const RELAY_PAGE_LIMIT = 50;
 const RELAY_FAIL_PAGES_MAX = 30;    // per failed status: up to 1500 failures counted
 const RELAY_SAMPLE_PAGES_MAX = 12;  // settled-request sample used for the rate denominator
 const RELAY_SETTLE_BUFFER = 300;    // ignore requests younger than this — still settling (fills are fast, but give them a grace window)
+const RELAY_MAX_RETRIES = 3;        // per page: retry 429/5xx/network before giving up
+const RELAY_RETRY_BASE_MS = 500;    // backoff base; grows 2^attempt with jitter
 
 // A completed swap/bridge is ONLY the `success` terminal state. Every other
 // outcome of a request old enough to have settled is a failure: the transfer
@@ -414,11 +416,38 @@ async function fetchJson(url, { timeoutMs = RPC_TIMEOUT_MS, ...opts } = {}) {
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
     const res = await fetch(url, { ...opts, signal: ctrl.signal });
-    if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
+    if (!res.ok) {
+      const err = new Error(`HTTP ${res.status} for ${url}`);
+      err.status = res.status; // preserved so callers can retry 429/5xx and report the code
+      throw err;
+    }
     return await res.json();
   } finally {
     clearTimeout(timer);
   }
+}
+
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Fetch one Relay page with backoff. Relay throttles bursts of parallel
+// requests (this app fires one query per status plus a sample, each paginated),
+// and a single 429 used to discard the whole card. Retry rate limits, 5xx and
+// transient network/timeout errors; a non-429 4xx is a contract error, so fail
+// fast rather than hammering.
+async function fetchRelayPage(url) {
+  let lastErr;
+  for (let attempt = 0; attempt <= RELAY_MAX_RETRIES; attempt++) {
+    try {
+      return await fetchJson(url, { timeoutMs: API_TIMEOUT_MS });
+    } catch (e) {
+      lastErr = e;
+      const s = e && e.status;
+      const retryable = s === undefined || s === 429 || (s >= 500 && s < 600);
+      if (!retryable || attempt === RELAY_MAX_RETRIES) break;
+      await delay(RELAY_RETRY_BASE_MS * 2 ** attempt + Math.random() * 250);
+    }
+  }
+  throw lastErr;
 }
 
 let rpcId = 1;
@@ -472,7 +501,7 @@ async function relayCountStatus(status, since, until) {
     let url = `${RELAY_API}?status=${status}&limit=${RELAY_PAGE_LIMIT}&startTimestamp=${since}`;
     if (until) url += `&endTimestamp=${until}`;
     if (continuation) url += `&continuation=${encodeURIComponent(continuation)}`;
-    const json = await fetchJson(url, { timeoutMs: API_TIMEOUT_MS });
+    const json = await fetchRelayPage(url);
 
     const results = json.requests || json.results || (Array.isArray(json.data) ? json.data : []) || [];
     for (const r of results) {
@@ -503,7 +532,7 @@ async function relaySample(since, until) {
   for (let page = 0; page < RELAY_SAMPLE_PAGES_MAX; page++) {
     let url = `${RELAY_API}?limit=${RELAY_PAGE_LIMIT}&startTimestamp=${since}&endTimestamp=${until}`;
     if (continuation) url += `&continuation=${encodeURIComponent(continuation)}`;
-    const json = await fetchJson(url, { timeoutMs: API_TIMEOUT_MS });
+    const json = await fetchRelayPage(url);
 
     const results = json.requests || json.results || (Array.isArray(json.data) ? json.data : []) || [];
     for (const r of results) {
@@ -530,26 +559,36 @@ async function scanRelay(lookbackHours) {
   // queried independently and tolerantly: a status the API rejects as a filter
   // is skipped rather than failing the whole scan (the rate still counts it,
   // because it classifies by "not success" rather than by an enumerated list).
+  // The rate sample is caught here too, so a flaky sample request degrades to
+  // "rate unavailable" instead of discarding the headline counts that loaded.
+  let lastErr = null;
   const statusJobs = RELAY_FAIL_STATUSES.map((st) =>
-    relayCountStatus(st, since, settleBefore).catch(() => null),
+    relayCountStatus(st, since, settleBefore).catch((e) => { lastErr = e; return null; }),
   );
   const [statusResults, sample] = await Promise.all([
     Promise.all(statusJobs),
-    relaySample(since, settleBefore),
+    relaySample(since, settleBefore).catch((e) => { lastErr = e; return null; }),
   ]);
 
   const counts = {};
   let total = 0;
   let truncated = false;
-  let missedStatuses = false;
+  let failedStatuses = 0;
   for (const res of statusResults) {
-    if (!res) { missedStatuses = true; continue; } // filter unsupported/unreachable
+    if (!res) { failedStatuses++; continue; } // filter unsupported/unreachable
     total += res.total;
     truncated = truncated || res.truncated;
     for (const [k, n] of Object.entries(res.counts)) counts[k] = (counts[k] || 0) + n;
   }
 
-  return { total, truncated, counts, sample, missedStatuses };
+  // Only when nothing came back at all — every status query failed AND the rate
+  // sample failed — is the API truly unreachable. Surface it (with the HTTP
+  // status, via lastErr) rather than rendering a bogus "0".
+  if (failedStatuses === RELAY_FAIL_STATUSES.length && !sample) {
+    throw lastErr || new Error('relay api unreachable');
+  }
+
+  return { total, truncated, counts, sample, missedStatuses: failedStatuses > 0 };
 }
 
 /* ------------------------------------------------------------------ */
@@ -809,6 +848,15 @@ function setRate(countId, rateId, count, failed, denominator) {
   }
 }
 
+// Self-diagnosing error note: surface the HTTP status so the failure mode is
+// obvious without opening devtools (429 = throttled, 5xx = outage, etc.).
+function relayErrorNote(e) {
+  const status = e && e.status;
+  if (status === 429) return 'relay api rate-limited (HTTP 429) — retried, still throttled';
+  if (status) return `relay api error (HTTP ${status})`;
+  return 'relay api unreachable';
+}
+
 function setCountError(id) {
   const node = el(id);
   node.classList.remove('loading', 'fail', 'ok');
@@ -884,21 +932,30 @@ async function refreshAll() {
   const relayJob = scanRelay(hours).then((res) => {
     if (token !== runToken) return;
     const { sample } = res;
-    setRate('relay-count', 'relay-rate', res.total, sample.failed, sample.completed);
-    el('relay-metrics').textContent = sample.completed > 0
-      ? `rate from ${sample.failed}/${sample.completed} settled ${sample.complete ? 'in window' : `of last ${sample.sampled}`}`
-      : 'no settled requests sampled for rate';
+    if (sample) {
+      setRate('relay-count', 'relay-rate', res.total, sample.failed, sample.completed);
+      el('relay-metrics').textContent = sample.completed > 0
+        ? `rate from ${sample.failed}/${sample.completed} settled ${sample.complete ? 'in window' : `of last ${sample.sampled}`}`
+        : 'no settled requests sampled for rate';
+    } else {
+      // Headline count survived but the rate sample didn't — show the count,
+      // drop the rate, rather than blanking the whole card.
+      setRate('relay-count', 'relay-rate', res.total, 0, 0);
+      el('relay-metrics').textContent = 'rate unavailable';
+    }
     const notes = [];
     if (res.truncated) notes.push('failure count capped');
-    if (res.missedStatuses) notes.push('some statuses uncountable (reflected in rate)');
-    if (!sample.complete) notes.push(`rate from most recent ${sample.sampled} settled requests`);
+    if (res.missedStatuses) notes.push(sample ? 'some statuses uncountable (reflected in rate)' : 'some statuses uncountable');
+    if (!sample) notes.push('rate sample unavailable');
+    else if (!sample.complete) notes.push(`rate from most recent ${sample.sampled} settled requests`);
     el('relay-note').textContent = notes.join(' · ');
     renderRelayChains(res.counts);
-  }).catch(() => {
+  }).catch((e) => {
     if (token !== runToken) return;
     setCountError('relay-count');
     el('relay-rate').textContent = '';
-    el('relay-note').textContent = 'relay api unreachable';
+    el('relay-metrics').textContent = '';
+    el('relay-note').textContent = relayErrorNote(e);
     el('relay-chains').innerHTML = '<div class="chain-row empty">unavailable</div>';
   });
 
