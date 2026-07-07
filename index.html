@@ -38,32 +38,12 @@
     color: var(--ink-muted);
     margin-bottom: 20px;
   }
-  .lookback {
-    display: inline-flex;
-    gap: 4px;
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: 999px;
-    padding: 4px;
-    margin-bottom: 32px;
-  }
-  .lookback button {
-    appearance: none;
-    border: none;
-    background: transparent;
-    color: var(--ink-secondary);
-    font: inherit;
-    font-size: 13px;
-    padding: 6px 18px;
-    border-radius: 999px;
-    cursor: pointer;
-    transition: background 0.15s, color 0.15s;
-  }
-  .lookback button:hover { color: var(--ink); }
-  .lookback button.active {
-    background: var(--surface2);
+  .main-title {
+    font-size: clamp(24px, 4vw, 34px);
+    font-weight: 700;
+    letter-spacing: -0.01em;
     color: var(--ink);
-    box-shadow: inset 0 0 0 1px var(--border);
+    margin-bottom: 32px;
   }
 
   /* ---------- hero cards ---------- */
@@ -216,11 +196,7 @@
 <div class="wrap">
   <div class="page-title">Failure / Revert Tracker</div>
 
-  <div class="lookback" id="lookback">
-    <button data-hours="1" class="active">1h</button>
-    <button data-hours="6">6h</button>
-    <button data-hours="24">24h</button>
-  </div>
+  <h1 class="main-title">Transaction failures in the last hour.</h1>
 
   <div class="heroes">
     <div class="card relay">
@@ -912,7 +888,7 @@ function renderAcrossChains(perChain, extraNames) {
 /* orchestration                                                       */
 /* ------------------------------------------------------------------ */
 
-let lookbackHours = 1;
+const lookbackHours = 1;
 let refreshTimer = null;
 let runToken = 0;
 
@@ -998,19 +974,6 @@ function scheduleRefresh() {
   if (refreshTimer) clearInterval(refreshTimer);
   refreshTimer = setInterval(refreshAll, REFRESH_MS);
 }
-
-el('lookback').addEventListener('click', (e) => {
-  const btn = e.target.closest('button[data-hours]');
-  if (!btn) return;
-  const hours = Number(btn.dataset.hours);
-  if (hours === lookbackHours) return;
-  lookbackHours = hours;
-  for (const b of el('lookback').querySelectorAll('button')) {
-    b.classList.toggle('active', b === btn);
-  }
-  refreshAll();
-  scheduleRefresh();
-});
 
 refreshAll();
 scheduleRefresh();
