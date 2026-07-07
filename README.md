@@ -22,7 +22,7 @@ deliver funds.
 
 - **Failures** — every non-`success` request from `api.relay.link/requests/v2`:
   the Relay-confirmed `failure` and `refund` states, plus requests still stuck
-  in `pending`/`depositing`/`submitted`/`waiting` after the settle buffer
+  in `pending`/`waiting`/`delayed` after the settle buffer
   (deposited but never delivered and never refunded). Each status is paginated
   over the window via `continuation`; a status the API won't accept as a filter
   is skipped from the headline count (the rate still counts it). If the page cap
