@@ -16,15 +16,24 @@ silently counted (or dropped).
 
 ### Relay
 
-- **Failures** — requests the `api.relay.link/requests/v2` API marks
-  `status=failure` **or** `status=refund` (a refund is only issued when the
-  transfer could not complete), paginated over the full window via
-  `continuation`. If the page cap is hit the count is shown as `N+`.
-- **Rate** — an unfiltered query over the same window gives the denominator:
-  completed = `success + failure + refund`. In-flight requests
-  (`waiting`/`pending`/`submitted`) are excluded. If the window has more
-  requests than the sample cap, the rate is computed over the most recent
-  sample and labeled as such.
+A completed transfer is **only** `status=success`. Anything else that a request
+old enough to have settled ends up in is a failure — the swap/bridge did not
+deliver funds.
+
+- **Failures** — every non-`success` request from `api.relay.link/requests/v2`:
+  the Relay-confirmed `failure` and `refund` states, plus requests still stuck
+  in `pending`/`depositing`/`submitted`/`waiting` after the settle buffer
+  (deposited but never delivered and never refunded). Each status is paginated
+  over the window via `continuation`; a status the API won't accept as a filter
+  is skipped from the headline count (the rate still counts it). If the page cap
+  is hit the count is shown as `N+`.
+- **Rate** — non-success over all settled requests. The sample only includes
+  requests created before `now − settle buffer`, so it isn't skewed by fresh
+  requests that fast-settling successes dominate while slower refunds are still
+  pending. If the window has more requests than the sample cap, the rate is
+  computed over the most recent settled sample and labeled as such.
+- **Settle buffer** — requests younger than a few minutes are excluded from
+  both the count and the rate; they may still legitimately be in flight.
 
 ### Across
 

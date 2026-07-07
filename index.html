@@ -243,7 +243,7 @@
       <div class="rate" id="relay-rate"></div>
       <div class="metrics" id="relay-metrics"></div>
       <div class="note muted" id="relay-note"></div>
-      <div class="card-sub">failed + refunded / completed requests</div>
+      <div class="card-sub">non-success / settled requests</div>
     </div>
 
     <div class="card across">
@@ -282,10 +282,13 @@
   </div>
 
   <div class="methodology">
-    <b>Methodology.</b> Relay: every request in the window with status
-    <b>failure</b> or <b>refund</b> (both are failed requests — a refund is paid
-    because the transfer could not complete), rated against completed requests
-    (success + failure + refund); in-flight requests are excluded from the rate.
+    <b>Methodology.</b> Relay: a completed transfer is only the <b>success</b>
+    status — <b>every other outcome is a failure</b>. That means Relay-confirmed
+    <b>failure</b> / <b>refund</b> plus any request still stuck in
+    <b>pending</b> / <b>depositing</b> / <b>submitted</b> / <b>waiting</b> after
+    a short settle buffer (funds went in but nothing came out). The rate is
+    non-success over all settled requests; only requests too fresh to have
+    settled are excluded.
     Across: <b>FundsDeposited</b> events are enumerated from every EVM SpokePool
     (addresses resolved live from the HubPool registry), and a sample of the
     most-recent settled deposits is classified <b>directly by the Across
@@ -315,7 +318,17 @@ const COUNT_CAP = 500;              // headline failure counter is capped for di
 const RELAY_API = 'https://api.relay.link/requests/v2';
 const RELAY_PAGE_LIMIT = 50;
 const RELAY_FAIL_PAGES_MAX = 30;    // per failed status: up to 1500 failures counted
-const RELAY_SAMPLE_PAGES_MAX = 12;  // all-status sample used for the rate denominator
+const RELAY_SAMPLE_PAGES_MAX = 12;  // settled-request sample used for the rate denominator
+const RELAY_SETTLE_BUFFER = 300;    // ignore requests younger than this — still settling (fills are fast, but give them a grace window)
+
+// A completed swap/bridge is ONLY the `success` terminal state. Every other
+// outcome of a request old enough to have settled is a failure: the transfer
+// did not complete. `failure`/`refund` are Relay-confirmed failures; a request
+// still stuck in `pending`/`depositing`/`submitted`/`waiting` past the settle
+// buffer never delivered funds either. These are the non-success statuses we
+// enumerate for the headline count (any the API rejects as a filter are just
+// skipped — the rate still counts them, since it classifies by "not success").
+const RELAY_FAIL_STATUSES = ['failure', 'refund', 'expired', 'pending', 'depositing', 'submitted', 'waiting'];
 
 const HUBPOOL = '0xc186fA914353c44b2E33eBE05f21846F1048bEda'; // Ethereum mainnet registry of all SpokePools
 const ETH_RPCS = ['https://ethereum-rpc.publicnode.com', 'https://eth.drpc.org'];
@@ -432,12 +445,14 @@ async function rpcAny(rpcUrls, method, params) {
 /* ------------------------------------------------------------------ */
 /* Relay scanner                                                       */
 /*                                                                     */
-/* Failures = requests the Relay API itself marks `failure` OR         */
-/* `refund` (a refund is only issued when the transfer failed).        */
-/* The rate denominator comes from an unfiltered sample of the same    */
-/* window: completed = success + failure + refund. In-flight           */
-/* (waiting/pending/submitted) requests are excluded — they haven't    */
-/* succeeded or failed yet.                                            */
+/* A completed transfer is ONLY the `success` status. Anything else in */
+/* a request old enough to have settled is a failure — it did not      */
+/* result in a complete swap/bridge. That covers Relay-confirmed       */
+/* `failure`/`refund` AND requests still stuck in `pending`/           */
+/* `depositing`/`submitted`/`waiting` past the settle buffer (funds    */
+/* deposited, never delivered, never refunded). Only requests too      */
+/* fresh to have settled (younger than RELAY_SETTLE_BUFFER) are        */
+/* excluded from the rate — they may still be in flight.               */
 /* ------------------------------------------------------------------ */
 
 function relayOriginChain(r) {
@@ -447,7 +462,7 @@ function relayOriginChain(r) {
     ?? 'unknown';
 }
 
-async function relayCountStatus(status, since) {
+async function relayCountStatus(status, since, until) {
   const counts = {};
   let total = 0;
   let continuation = null;
@@ -455,6 +470,7 @@ async function relayCountStatus(status, since) {
 
   for (let page = 0; page < RELAY_FAIL_PAGES_MAX; page++) {
     let url = `${RELAY_API}?status=${status}&limit=${RELAY_PAGE_LIMIT}&startTimestamp=${since}`;
+    if (until) url += `&endTimestamp=${until}`;
     if (continuation) url += `&continuation=${encodeURIComponent(continuation)}`;
     const json = await fetchJson(url, { timeoutMs: API_TIMEOUT_MS });
 
@@ -472,15 +488,20 @@ async function relayCountStatus(status, since) {
   return { total, counts, truncated };
 }
 
-async function relaySample(since) {
-  let completed = 0;
-  let failed = 0;
+async function relaySample(since, until) {
+  // Sample requests old enough to have settled (created before `until`), and
+  // classify each: `success` = a completed swap/bridge, anything else = a
+  // failure. Bounding by `until` is the key fix — without it the freshest
+  // requests (fast successes settle in seconds, refunds lag by minutes)
+  // dominate the sample and bias the rate low.
+  let completed = 0; // requests with a known status (the rate denominator)
+  let failed = 0;    // completed requests whose status is not `success`
   let sampled = 0;
   let continuation = null;
   let complete = false;
 
   for (let page = 0; page < RELAY_SAMPLE_PAGES_MAX; page++) {
-    let url = `${RELAY_API}?limit=${RELAY_PAGE_LIMIT}&startTimestamp=${since}`;
+    let url = `${RELAY_API}?limit=${RELAY_PAGE_LIMIT}&startTimestamp=${since}&endTimestamp=${until}`;
     if (continuation) url += `&continuation=${encodeURIComponent(continuation)}`;
     const json = await fetchJson(url, { timeoutMs: API_TIMEOUT_MS });
 
@@ -488,10 +509,9 @@ async function relaySample(since) {
     for (const r of results) {
       sampled++;
       const s = String(r.status || '').toLowerCase();
-      if (s === 'success' || s === 'failure' || s === 'refund') {
-        completed++;
-        if (s !== 'success') failed++;
-      }
+      if (!s) continue;              // no status to classify — skip
+      completed++;
+      if (s !== 'success') failed++; // anything that isn't a completed transfer is a failure
     }
 
     continuation = json.continuation ?? json.data?.continuation ?? null;
@@ -502,23 +522,34 @@ async function relaySample(since) {
 }
 
 async function scanRelay(lookbackHours) {
-  const since = Math.floor(Date.now() / 1000) - lookbackHours * 3600;
+  const now = Math.floor(Date.now() / 1000);
+  const since = now - lookbackHours * 3600;
+  const settleBefore = now - RELAY_SETTLE_BUFFER;
 
-  const [failure, refund, sample] = await Promise.all([
-    relayCountStatus('failure', since),
-    relayCountStatus('refund', since),
-    relaySample(since),
+  // Headline count = every non-success request (settled-age). Each status is
+  // queried independently and tolerantly: a status the API rejects as a filter
+  // is skipped rather than failing the whole scan (the rate still counts it,
+  // because it classifies by "not success" rather than by an enumerated list).
+  const statusJobs = RELAY_FAIL_STATUSES.map((st) =>
+    relayCountStatus(st, since, settleBefore).catch(() => null),
+  );
+  const [statusResults, sample] = await Promise.all([
+    Promise.all(statusJobs),
+    relaySample(since, settleBefore),
   ]);
 
-  const counts = { ...failure.counts };
-  for (const [k, n] of Object.entries(refund.counts)) counts[k] = (counts[k] || 0) + n;
+  const counts = {};
+  let total = 0;
+  let truncated = false;
+  let missedStatuses = false;
+  for (const res of statusResults) {
+    if (!res) { missedStatuses = true; continue; } // filter unsupported/unreachable
+    total += res.total;
+    truncated = truncated || res.truncated;
+    for (const [k, n] of Object.entries(res.counts)) counts[k] = (counts[k] || 0) + n;
+  }
 
-  return {
-    total: failure.total + refund.total,
-    truncated: failure.truncated || refund.truncated,
-    counts,
-    sample,
-  };
+  return { total, truncated, counts, sample, missedStatuses };
 }
 
 /* ------------------------------------------------------------------ */
@@ -855,11 +886,12 @@ async function refreshAll() {
     const { sample } = res;
     setRate('relay-count', 'relay-rate', res.total, sample.failed, sample.completed);
     el('relay-metrics').textContent = sample.completed > 0
-      ? `rate from ${sample.failed}/${sample.completed} ${sample.complete ? 'in window' : `of last ${sample.sampled}`}`
-      : 'no completed requests sampled for rate';
+      ? `rate from ${sample.failed}/${sample.completed} settled ${sample.complete ? 'in window' : `of last ${sample.sampled}`}`
+      : 'no settled requests sampled for rate';
     const notes = [];
     if (res.truncated) notes.push('failure count capped');
-    if (!sample.complete) notes.push(`rate from most recent ${sample.sampled} requests`);
+    if (res.missedStatuses) notes.push('some statuses uncountable (reflected in rate)');
+    if (!sample.complete) notes.push(`rate from most recent ${sample.sampled} settled requests`);
     el('relay-note').textContent = notes.join(' · ');
     renderRelayChains(res.counts);
   }).catch(() => {
