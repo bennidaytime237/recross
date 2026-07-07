@@ -38,6 +38,13 @@
     color: var(--ink-muted);
     margin-bottom: 20px;
   }
+  .main-title {
+    font-size: clamp(24px, 4vw, 34px);
+    font-weight: 700;
+    letter-spacing: -0.01em;
+    color: var(--ink);
+    margin-bottom: 24px;
+  }
   .lookback {
     display: inline-flex;
     gap: 4px;
@@ -216,10 +223,10 @@
 <div class="wrap">
   <div class="page-title">Failure / Revert Tracker</div>
 
+  <h1 class="main-title">Transaction failures in the last hour.</h1>
+
   <div class="lookback" id="lookback">
     <button data-hours="1" class="active">1h</button>
-    <button data-hours="6">6h</button>
-    <button data-hours="24">24h</button>
   </div>
 
   <div class="heroes">
