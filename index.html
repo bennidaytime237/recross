@@ -310,7 +310,7 @@
 /* config                                                              */
 /* ------------------------------------------------------------------ */
 
-const REFRESH_MS = 120_000;
+const REFRESH_MS = 300_000;   // auto-refresh cadence; kept slow to stay well under Relay's rate limit
 const RPC_TIMEOUT_MS = 10_000;
 const API_TIMEOUT_MS = 15_000;
 const COUNT_CAP = 500;              // headline failure counter is capped for display; shows "500+" beyond this

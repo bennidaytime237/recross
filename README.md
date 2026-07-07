@@ -4,7 +4,7 @@ Real-time failure/revert tracker comparing [Across Protocol](https://across.to) 
 
 A single-file, dependency-free HTML app (`index.html`) that shows the cross-chain
 transfer **failure rate** for each protocol (plus underlying counts and a
-per-chain breakdown), with a 1h/6h/24h lookback toggle and 2-minute auto-refresh.
+per-chain breakdown), with a 1h/6h/24h lookback toggle and 5-minute auto-refresh.
 
 ## Methodology
 
