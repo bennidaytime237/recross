@@ -1,0 +1,580 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Failure / Revert Tracker</title>
+<style>
+  :root {
+    --bg: #0b0e14;
+    --surface: #11151f;
+    --surface2: #171c29;
+    --border: #232a3a;
+    --ink: #e6e9f0;
+    --ink-secondary: #9aa3b5;
+    --ink-muted: #5c6577;
+    --relay: #7c3aed;
+    --across: #0891b2;
+    --fail: #f87171;
+    --ok: #2dd4bf;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font-family: "SF Mono", "JetBrains Mono", "Fira Code", ui-monospace, Menlo, Consolas, monospace;
+    min-height: 100vh;
+    padding: 40px 24px 64px;
+  }
+  .wrap { max-width: 960px; margin: 0 auto; }
+
+  /* ---------- header ---------- */
+  .page-title {
+    font-size: 12px;
+    letter-spacing: 0.22em;
+    text-transform: uppercase;
+    color: var(--ink-muted);
+    margin-bottom: 20px;
+  }
+  .lookback {
+    display: inline-flex;
+    gap: 4px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 4px;
+    margin-bottom: 32px;
+  }
+  .lookback button {
+    appearance: none;
+    border: none;
+    background: transparent;
+    color: var(--ink-secondary);
+    font: inherit;
+    font-size: 13px;
+    padding: 6px 18px;
+    border-radius: 999px;
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s;
+  }
+  .lookback button:hover { color: var(--ink); }
+  .lookback button.active {
+    background: var(--surface2);
+    color: var(--ink);
+    box-shadow: inset 0 0 0 1px var(--border);
+  }
+
+  /* ---------- hero cards ---------- */
+  .heroes {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 20px;
+    margin-bottom: 40px;
+  }
+  @media (max-width: 640px) { .heroes { grid-template-columns: 1fr; } }
+  .card {
+    background: var(--surface);
+    border-radius: 14px;
+    padding: 26px 28px 30px;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    min-height: 220px;
+  }
+  .card.relay  { border: 1px solid var(--relay);  box-shadow: 0 0 0 1px rgba(124, 58, 237, 0.25), 0 0 32px -14px rgba(124, 58, 237, 0.5); }
+  .card.across { border: 1px solid var(--across); box-shadow: 0 0 0 1px rgba(8, 145, 178, 0.25),  0 0 32px -14px rgba(8, 145, 178, 0.5); }
+  .card-head {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 22px;
+  }
+  .card-head svg { width: 32px; height: 32px; display: block; }
+  .card-head .proto-name {
+    font-size: 15px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+  }
+  .count {
+    font-size: clamp(56px, 10vw, 92px);
+    font-weight: 700;
+    line-height: 1;
+    font-variant-numeric: tabular-nums;
+    color: var(--ink-muted);
+  }
+  .count.fail { color: var(--fail); }
+  .count.ok   { color: var(--ok); }
+  .count.loading {
+    animation: shimmer-pulse 1.4s ease-in-out infinite;
+  }
+  @keyframes shimmer-pulse {
+    0%, 100% { opacity: 0.85; filter: brightness(1); }
+    50%      { opacity: 0.35; filter: brightness(1.5); }
+  }
+  .progress {
+    margin-top: 12px;
+    font-size: 12px;
+    color: var(--ink-muted);
+    min-height: 16px;
+  }
+  .card-sub {
+    margin-top: auto;
+    padding-top: 14px;
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--ink-muted);
+  }
+
+  /* ---------- breakdown ---------- */
+  .breakdown {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 20px;
+  }
+  @media (max-width: 640px) { .breakdown { grid-template-columns: 1fr; } }
+  .col {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 18px 20px;
+  }
+  .col-title {
+    font-size: 11px;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: var(--ink-muted);
+    margin-bottom: 14px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .col-title .dot { width: 8px; height: 8px; border-radius: 50%; }
+  .col.relay-col  .dot { background: var(--relay); }
+  .col.across-col .dot { background: var(--across); }
+  .chain-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    padding: 8px 2px;
+    border-bottom: 1px solid var(--border);
+    font-size: 13px;
+  }
+  .chain-row:last-child { border-bottom: none; }
+  .chain-row .name  { color: var(--ink-secondary); }
+  .chain-row .num   { color: var(--fail); font-variant-numeric: tabular-nums; font-weight: 600; }
+  .chain-row.empty  { color: var(--ink-muted); justify-content: flex-start; border-bottom: none; }
+  .skeleton {
+    height: 14px;
+    margin: 10px 2px;
+    border-radius: 4px;
+    background: linear-gradient(90deg, var(--surface2) 25%, var(--border) 50%, var(--surface2) 75%);
+    background-size: 200% 100%;
+    animation: skel 1.3s linear infinite;
+  }
+  @keyframes skel { from { background-position: 200% 0; } to { background-position: -200% 0; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="page-title">Failure / Revert Tracker</div>
+
+  <div class="lookback" id="lookback">
+    <button data-hours="1" class="active">1h</button>
+    <button data-hours="6">6h</button>
+    <button data-hours="24">24h</button>
+  </div>
+
+  <div class="heroes">
+    <div class="card relay">
+      <div class="card-head">
+        <!-- Relay logo: purple square, white starburst with long right arm -->
+        <svg viewBox="0 0 32 32" aria-hidden="true">
+          <rect width="32" height="32" rx="6" fill="#4B1FE0"/>
+          <g stroke="#fff" stroke-width="2.1" stroke-linecap="round">
+            <line x1="10" y1="16" x2="10"   y2="9.5"/>
+            <line x1="10" y1="16" x2="14.6" y2="11.4"/>
+            <line x1="10" y1="16" x2="10"   y2="22.5"/>
+            <line x1="10" y1="16" x2="14.6" y2="20.6"/>
+            <line x1="10" y1="16" x2="5.4"  y2="11.4"/>
+            <line x1="10" y1="16" x2="5.4"  y2="20.6"/>
+            <line x1="10" y1="16" x2="26.5" y2="16"/>
+          </g>
+        </svg>
+        <span class="proto-name">Relay</span>
+      </div>
+      <div class="count loading" id="relay-count">—</div>
+      <div class="progress" id="relay-progress"></div>
+      <div class="card-sub">failed requests</div>
+    </div>
+
+    <div class="card across">
+      <div class="card-head">
+        <!-- Across logo: mint circle, dark broken X of four tapering arms -->
+        <svg viewBox="0 0 32 32" aria-hidden="true">
+          <circle cx="16" cy="16" r="16" fill="#6EE7B7"/>
+          <g fill="#111">
+            <polygon points="6.4,9.6 9.6,6.4 14.1,11.3 11.3,14.1"/>
+            <polygon points="25.6,9.6 22.4,6.4 17.9,11.3 20.7,14.1"/>
+            <polygon points="6.4,22.4 9.6,25.6 14.1,20.7 11.3,17.9"/>
+            <polygon points="25.6,22.4 22.4,25.6 17.9,20.7 20.7,17.9"/>
+          </g>
+        </svg>
+        <span class="proto-name">Across</span>
+      </div>
+      <div class="count loading" id="across-count">—</div>
+      <div class="progress" id="across-progress"></div>
+      <div class="card-sub">expired / refunded / stuck deposits</div>
+    </div>
+  </div>
+
+  <div class="breakdown">
+    <div class="col relay-col">
+      <div class="col-title"><span class="dot"></span>Relay · by origin chain</div>
+      <div id="relay-chains"></div>
+    </div>
+    <div class="col across-col">
+      <div class="col-title"><span class="dot"></span>Across · by origin chain</div>
+      <div id="across-chains"></div>
+    </div>
+  </div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/ethers/5.7.2/ethers.umd.min.js"></script>
+<script>
+'use strict';
+
+/* ------------------------------------------------------------------ */
+/* config                                                              */
+/* ------------------------------------------------------------------ */
+
+const REFRESH_MS = 90_000;
+const RPC_TIMEOUT_MS = 8_000;
+const RELAY_MAX_PAGES = 10;
+const ACROSS_PAGES_PER_CHAIN = 3;
+const ACROSS_BLOCKS_PER_PAGE = 2000;
+const ACROSS_STATUS_CHECK_CAP = 20;
+
+const ACROSS_CHAINS = [
+  { id: 1,       spokePool: '0x5c7BCd6E7De5423a257D81B442095A1a6ced35C5',  rpc: 'https://ethereum-rpc.publicnode.com',             blocksPerHour: 300   },
+  { id: 42161,   spokePool: '0xe35e9842fceaCA96570B734083f4a58e8F7C5f2A',  rpc: 'https://arb1.arbitrum.io/rpc',                    blocksPerHour: 14400 },
+  { id: 8453,    spokePool: '0x09aea4b2242abC8bb4BB78D537A67a245A7bEC64',  rpc: 'https://mainnet.base.org',                        blocksPerHour: 1800  },
+  { id: 10,      spokePool: '0x6f26Bf09B1C792e3228e5467807a900A503c0281',  rpc: 'https://mainnet.optimism.io',                     blocksPerHour: 1800  },
+  { id: 137,     spokePool: '0x9295ee1d8C5b022Be115A2AD3c30C72E34e7F096',  rpc: 'https://polygon-bor-rpc.publicnode.com',          blocksPerHour: 1600  },
+  { id: 59144,   spokePool: '0x7E63A5f1a8F0B4d0934B2f2327DAED3F6bb2ee75',  rpc: 'https://linea-rpc.publicnode.com',                blocksPerHour: 300   },
+  { id: 324,     spokePool: '0xE0B015E54d54fc84a6cB9B666099Fb76B795535FF', rpc: 'https://mainnet.era.zksync.io',                   blocksPerHour: 3600  },
+  { id: 81457,   spokePool: '0x2D509190Ed0172ba588407D4c2df918F955Cc6E1',  rpc: 'https://blast-rpc.publicnode.com',                blocksPerHour: 1800  },
+  { id: 56,      spokePool: '0x4e8E3B22b0F0a6821F5e1a04D84b4Bc30ACE27d505', rpc: 'https://bsc-rpc.publicnode.com',                 blocksPerHour: 1200  },
+  { id: 130,     spokePool: '0x09aea4b2242abC8bb4BB78D537A67a245A7bEC64',  rpc: 'https://unichain-rpc.publicnode.com',             blocksPerHour: 3600  },
+  { id: 480,     spokePool: '0x09aea4b2242abC8bb4BB78D537A67a245A7bEC64',  rpc: 'https://worldchain-mainnet.g.alchemy.com/public', blocksPerHour: 1800  },
+  { id: 7777777, spokePool: '0x13fDac9F9b4777705db45291bbFF3c972c6d1d97',  rpc: 'https://rpc.zora.energy',                         blocksPerHour: 1800  },
+  { id: 34443,   spokePool: '0x3baD7AD0728f9917d1Bf08af5782dCbD516cDd96',  rpc: 'https://mainnet.mode.network',                    blocksPerHour: 1800  },
+  { id: 1135,    spokePool: '0x9552a0a6624A23B848060AE5901659CDDa1f83f8',  rpc: 'https://rpc.api.lisk.com',                        blocksPerHour: 1800  },
+  { id: 1868,    spokePool: '0x3baD7AD0728f9917d1Bf08af5782dCbD516cDd96',  rpc: 'https://rpc.soneium.org',                         blocksPerHour: 1800  },
+  { id: 57073,   spokePool: '0xeF684C38f94F227E42bE8f21C99F4e65f9f73d4',   rpc: 'https://rpc-qnd.inkonchain.com',                  blocksPerHour: 1800  },
+  { id: 999,     spokePool: '0x35E6DE4C8A0c5f2d2F16E84f94eF4eBe4B990E04',  rpc: 'https://rpc.hyperliquid.xyz/evm',                 blocksPerHour: 3600  },
+];
+
+const CHAIN_NAMES = {
+  1: 'Ethereum', 10: 'Optimism', 56: 'BNB Chain', 100: 'Gnosis', 130: 'Unichain',
+  137: 'Polygon', 250: 'Fantom', 324: 'zkSync Era', 480: 'World Chain', 999: 'HyperEVM',
+  1101: 'Polygon zkEVM', 1135: 'Lisk', 1329: 'Sei', 1868: 'Soneium', 2741: 'Abstract',
+  5000: 'Mantle', 8453: 'Base', 33139: 'ApeChain', 34443: 'Mode', 42161: 'Arbitrum',
+  42170: 'Arbitrum Nova', 43114: 'Avalanche', 57073: 'Ink', 59144: 'Linea',
+  80094: 'Berachain', 81457: 'Blast', 167000: 'Taiko', 534352: 'Scroll',
+  7777777: 'Zora', 728126428: 'Tron', 792703809: 'Solana', 8253038: 'Bitcoin',
+  1151111081099710: 'Solana',
+};
+
+const V3_DEPOSIT_ABI = [
+  'event V3FundsDeposited(address inputToken, address outputToken, uint256 inputAmount, uint256 outputAmount, uint256 indexed destinationChainId, uint32 indexed depositId, uint32 quoteTimestamp, uint32 fillDeadline, uint32 exclusivityDeadline, address indexed depositor, address recipient, address exclusiveRelayer, bytes message)',
+];
+let depositIface = null;
+let DEPOSIT_TOPIC = null;
+try {
+  depositIface = new ethers.utils.Interface(V3_DEPOSIT_ABI);
+  DEPOSIT_TOPIC = depositIface.getEventTopic('V3FundsDeposited');
+} catch { /* ethers CDN unavailable — Across scan disabled, Relay still works */ }
+
+/* ------------------------------------------------------------------ */
+/* fetch helpers                                                       */
+/* ------------------------------------------------------------------ */
+
+async function fetchJson(url, { timeoutMs = RPC_TIMEOUT_MS, ...opts } = {}) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { ...opts, signal: ctrl.signal });
+    if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
+    return await res.json();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+let rpcId = 1;
+async function rpcCall(rpcUrl, method, params) {
+  const body = JSON.stringify({ jsonrpc: '2.0', id: rpcId++, method, params });
+  const json = await fetchJson(rpcUrl, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body,
+  });
+  if (json.error) throw new Error(`RPC ${method}: ${json.error.message || 'error'}`);
+  return json.result;
+}
+
+/* ------------------------------------------------------------------ */
+/* Relay scanner                                                       */
+/* ------------------------------------------------------------------ */
+
+async function scanRelay(lookbackHours) {
+  const since = Math.floor(Date.now() / 1000) - lookbackHours * 3600;
+  const counts = {};
+  let total = 0;
+  let continuation = null;
+
+  for (let page = 0; page < RELAY_MAX_PAGES; page++) {
+    let url = `https://api.relay.link/requests/v2?status=failure&limit=50&startTimestamp=${since}`;
+    if (continuation) url += `&continuation=${encodeURIComponent(continuation)}`;
+    const json = await fetchJson(url, { timeoutMs: 15_000 });
+
+    const results = json.requests || json.results || (Array.isArray(json.data) ? json.data : []) || [];
+    for (const r of results) {
+      const cid = r.originChainId
+        ?? r.data?.originChainId
+        ?? r.data?.inTxs?.[0]?.chainId;
+      const key = cid ?? 'unknown';
+      counts[key] = (counts[key] || 0) + 1;
+      total++;
+    }
+
+    continuation = json.continuation ?? json.data?.continuation ?? null;
+    if (!continuation || results.length === 0) break;
+  }
+
+  return { total, counts };
+}
+
+/* ------------------------------------------------------------------ */
+/* Across scanner                                                      */
+/* ------------------------------------------------------------------ */
+
+async function fetchAcrossChainNames() {
+  try {
+    const json = await fetchJson('https://app.across.to/api/swap/chains', { timeoutMs: 15_000 });
+    const list = Array.isArray(json) ? json : (json.chains || []);
+    const names = {};
+    for (const c of list) {
+      if (c && c.chainId != null && c.name) names[c.chainId] = c.name;
+    }
+    return names;
+  } catch {
+    return {};
+  }
+}
+
+async function scanAcrossChain(chain, lookbackHours) {
+  const nowSec = Math.floor(Date.now() / 1000);
+  const latestHex = await rpcCall(chain.rpc, 'eth_blockNumber', []);
+  const latest = parseInt(latestHex, 16);
+  const lookbackBlocks = Math.max(1, Math.round(chain.blocksPerHour * lookbackHours));
+  const floor = Math.max(0, latest - lookbackBlocks);
+
+  // Walk backward from the tip in fixed-size pages, never past the lookback floor.
+  const candidates = [];
+  let toBlock = latest;
+  for (let page = 0; page < ACROSS_PAGES_PER_CHAIN && toBlock > floor; page++) {
+    const fromBlock = Math.max(floor, toBlock - ACROSS_BLOCKS_PER_PAGE + 1);
+    let logs;
+    try {
+      logs = await rpcCall(chain.rpc, 'eth_getLogs', [{
+        address: chain.spokePool,
+        topics: [DEPOSIT_TOPIC],
+        fromBlock: '0x' + fromBlock.toString(16),
+        toBlock: '0x' + toBlock.toString(16),
+      }]);
+    } catch {
+      break;
+    }
+    for (const log of logs) {
+      try {
+        const parsed = depositIface.parseLog(log);
+        const fillDeadline = Number(parsed.args.fillDeadline);
+        if (fillDeadline < nowSec) {
+          candidates.push(Number(parsed.args.depositId));
+        }
+      } catch { /* non-matching log shape */ }
+    }
+    toBlock = fromBlock - 1;
+  }
+
+  // Verify past-deadline deposits against the status API, capped per chain.
+  let failures = 0;
+  for (const depositId of candidates.slice(0, ACROSS_STATUS_CHECK_CAP)) {
+    try {
+      const json = await fetchJson(
+        `https://app.across.to/api/deposit/status?depositId=${depositId}&originChainId=${chain.id}`,
+        { timeoutMs: RPC_TIMEOUT_MS },
+      );
+      const status = String(json.status || '').toLowerCase();
+      if (status === 'expired' || status === 'refunded' || status === 'pending') failures++;
+    } catch { /* status check failed — don't count */ }
+  }
+  return failures;
+}
+
+async function scanAcross(lookbackHours, onProgress) {
+  if (!DEPOSIT_TOPIC) throw new Error('ethers unavailable');
+  const apiNames = await fetchAcrossChainNames();
+  // Cross-reference: scan the hardcoded chains, restricted to those the Swap
+  // API confirms (scan everything if the chain list is unavailable).
+  const apiIds = new Set(Object.keys(apiNames).map(Number));
+  const scannable = apiIds.size > 0
+    ? ACROSS_CHAINS.filter((c) => apiIds.has(c.id))
+    : ACROSS_CHAINS;
+
+  const counts = {};
+  let done = 0;
+  onProgress(done, scannable.length);
+
+  const queue = scannable.slice();
+  const CONCURRENCY = 5;
+  const workers = Array.from({ length: CONCURRENCY }, async () => {
+    for (;;) {
+      const chain = queue.shift();
+      if (!chain) return;
+      let n = 0;
+      try {
+        n = await scanAcrossChain(chain, lookbackHours);
+      } catch { /* chain unreachable — count nothing */ }
+      if (n > 0) counts[chain.id] = (counts[chain.id] || 0) + n;
+      done++;
+      onProgress(done, scannable.length);
+    }
+  });
+  await Promise.all(workers);
+
+  const total = Object.values(counts).reduce((a, b) => a + b, 0);
+  return { total, counts, names: apiNames };
+}
+
+/* ------------------------------------------------------------------ */
+/* rendering                                                           */
+/* ------------------------------------------------------------------ */
+
+const el = (id) => document.getElementById(id);
+
+function setCountLoading(id) {
+  const node = el(id);
+  node.classList.add('loading');
+  node.classList.remove('fail', 'ok');
+}
+
+function setCount(id, value) {
+  const node = el(id);
+  node.classList.remove('loading');
+  node.classList.toggle('fail', value > 0);
+  node.classList.toggle('ok', value === 0);
+  node.textContent = String(value);
+}
+
+function setCountError(id) {
+  const node = el(id);
+  node.classList.remove('loading', 'fail', 'ok');
+  node.textContent = '—';
+}
+
+function renderSkeleton(containerId, rows = 4) {
+  el(containerId).innerHTML = '<div class="skeleton"></div>'.repeat(rows);
+}
+
+function chainName(id, extraNames = {}) {
+  return extraNames[id] || CHAIN_NAMES[id] || (id === 'unknown' ? 'Unknown' : `Chain ${id}`);
+}
+
+function renderChainList(containerId, counts, extraNames = {}) {
+  const entries = Object.entries(counts)
+    .filter(([, n]) => n > 0)
+    .sort((a, b) => b[1] - a[1]);
+  const container = el(containerId);
+  if (entries.length === 0) {
+    container.innerHTML = '<div class="chain-row empty">no failures detected</div>';
+    return;
+  }
+  container.innerHTML = entries.map(([id, n]) => {
+    const name = chainName(/^\d+$/.test(id) ? Number(id) : id, extraNames);
+    return `<div class="chain-row"><span class="name">${name}</span><span class="num">${n}</span></div>`;
+  }).join('');
+}
+
+/* ------------------------------------------------------------------ */
+/* orchestration                                                       */
+/* ------------------------------------------------------------------ */
+
+let lookbackHours = 1;
+let refreshTimer = null;
+let runToken = 0;
+
+async function refreshAll() {
+  const token = ++runToken;
+  const hours = lookbackHours;
+
+  setCountLoading('relay-count');
+  setCountLoading('across-count');
+  el('relay-progress').textContent = '';
+  el('across-progress').textContent = '';
+  renderSkeleton('relay-chains');
+  renderSkeleton('across-chains');
+
+  const relayJob = scanRelay(hours).then((res) => {
+    if (token !== runToken) return;
+    setCount('relay-count', res.total);
+    renderChainList('relay-chains', res.counts);
+  }).catch(() => {
+    if (token !== runToken) return;
+    setCountError('relay-count');
+    el('relay-chains').innerHTML = '<div class="chain-row empty">unavailable</div>';
+  });
+
+  const acrossJob = scanAcross(hours, (done, totalChains) => {
+    if (token !== runToken) return;
+    el('across-progress').textContent =
+      done < totalChains ? `scanning ${done}/${totalChains}...` : '';
+  }).then((res) => {
+    if (token !== runToken) return;
+    setCount('across-count', res.total);
+    renderChainList('across-chains', res.counts, res.names);
+  }).catch(() => {
+    if (token !== runToken) return;
+    setCountError('across-count');
+    el('across-progress').textContent = '';
+    el('across-chains').innerHTML = '<div class="chain-row empty">unavailable</div>';
+  });
+
+  await Promise.allSettled([relayJob, acrossJob]);
+}
+
+function scheduleRefresh() {
+  if (refreshTimer) clearInterval(refreshTimer);
+  refreshTimer = setInterval(refreshAll, REFRESH_MS);
+}
+
+el('lookback').addEventListener('click', (e) => {
+  const btn = e.target.closest('button[data-hours]');
+  if (!btn) return;
+  const hours = Number(btn.dataset.hours);
+  if (hours === lookbackHours) return;
+  lookbackHours = hours;
+  for (const b of el('lookback').querySelectorAll('button')) {
+    b.classList.toggle('active', b === btn);
+  }
+  refreshAll();
+  scheduleRefresh();
+});
+
+refreshAll();
+scheduleRefresh();
+</script>
+</body>
+</html>
